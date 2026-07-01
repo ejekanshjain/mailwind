@@ -252,6 +252,12 @@ function App() {
       leftAltDownRef.current = false;
     };
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (isSettingsShortcut(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        openSettings();
+        return;
+      }
       if (event.code === "AltLeft") {
         leftAltDownRef.current = true;
         return;
@@ -461,6 +467,12 @@ function App() {
     if (nextFolder && nextFolder !== folder) {
       selectFolder(nextFolder);
     }
+  }
+
+  function openSettings() {
+    setView("settings");
+    setSelectedId(null);
+    setSelectedMessage(null);
   }
 
   function handleMessageListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
@@ -861,11 +873,7 @@ function App() {
           </button>
           <button
             className={view === "settings" ? "settings-button active" : "settings-button"}
-            onClick={() => {
-              setView("settings");
-              setSelectedId(null);
-              setSelectedMessage(null);
-            }}
+            onClick={openSettings}
             title="Settings"
           >
             <Settings size={17} /> Settings
@@ -1476,6 +1484,11 @@ function emailLinkMessageHref(value: unknown) {
     return "";
   }
   return payload.href;
+}
+
+function isSettingsShortcut(event: globalThis.KeyboardEvent) {
+  const modifier = event.metaKey || event.ctrlKey;
+  return modifier && !event.altKey && !event.shiftKey && (event.key === "," || event.code === "Comma");
 }
 
 function isEditableTarget(target: EventTarget | null) {

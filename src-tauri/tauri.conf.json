@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "mailwind",
+  "productName": "Mailwind",
   "version": "0.1.0",
   "identifier": "com.mailwind.desktop",
   "build": {
@@ -26,7 +26,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "rpm"],
+    "targets": ["deb", "rpm", "appimage"],
+    "publisher": "Mailwind",
+    "category": "Productivity",
+    "shortDescription": "Local-first desktop email workspace.",
+    "longDescription": "Mailwind is a local-first desktop email app for Gmail, Google Workspace, and IMAP/SMTP accounts.",
+    "copyright": "Copyright (c) 2026 Mailwind",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

@@ -1,5 +1,6 @@
 {
   "name": "mailwind",
+  "description": "Local-first desktop email workspace for Gmail, Google Workspace, and IMAP/SMTP accounts.",
   "private": true,
   "version": "0.1.0",
   "type": "module",
