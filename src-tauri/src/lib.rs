@@ -415,7 +415,6 @@ fn get_account(conn: &Connection, id: i64) -> AppResult<StoredAccount> {
 }
 
 fn upsert_message(conn: &Connection, account_id: i64, msg: &NewMessage) -> AppResult<()> {
-    prepare_imap_message_identity(conn, account_id, msg)?;
     let ts = now_ts();
     conn.execute(
         "
@@ -496,77 +495,6 @@ fn upsert_message(conn: &Connection, account_id: i64, msg: &NewMessage) -> AppRe
         .map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-fn prepare_imap_message_identity(
-    conn: &Connection,
-    account_id: i64,
-    msg: &NewMessage,
-) -> AppResult<()> {
-    let Some(message_id) = msg.provider_message_id.strip_prefix("imap-message:") else {
-        return Ok(());
-    };
-    if message_id.trim().is_empty() {
-        return Ok(());
-    }
-
-    let legacy_like = format!("%:{}", escape_sql_like(message_id));
-    let exact_id = conn
-        .query_row(
-            "SELECT id FROM messages WHERE account_id = ? AND provider_message_id = ?",
-            params![account_id, msg.provider_message_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare(
-            "
-            SELECT id
-            FROM messages
-            WHERE account_id = ?
-              AND provider_message_id != ?
-              AND provider_message_id NOT LIKE 'local-sent-%'
-              AND provider_message_id LIKE ? ESCAPE '\\'
-            ORDER BY CASE WHEN folder = ? THEN 0 ELSE 1 END, updated_at DESC, id DESC
-            ",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(
-            params![account_id, msg.provider_message_id, legacy_like, msg.folder],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|e| e.to_string())?;
-    let legacy_ids = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    drop(stmt);
-
-    if exact_id.is_none() {
-        if let Some(id) = legacy_ids.first() {
-            conn.execute(
-                "UPDATE messages SET provider_message_id = ?, updated_at = ? WHERE id = ?",
-                params![msg.provider_message_id, now_ts(), id],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        for id in legacy_ids.iter().skip(1) {
-            delete_message_row(conn, *id)?;
-        }
-    } else {
-        for id in legacy_ids {
-            delete_message_row(conn, id)?;
-        }
-    }
-    Ok(())
-}
-
-fn escape_sql_like(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 fn delete_message_row(conn: &Connection, id: i64) -> AppResult<()> {
@@ -1801,32 +1729,40 @@ fn poll_imap_inbox(
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         existing_thread_ids(&conn, account.id, "Inbox")?
     };
-    let set = selected
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
-    let fetches = session
-        .uid_fetch(set, "(FLAGS)")
-        .map_err(|e| e.to_string())?;
     let mut missing_uids = Vec::new();
-    let mut changed = 0;
-    for fetch in fetches.iter() {
-        let uid = fetch.uid.unwrap_or(fetch.message);
+    let mut existing_uids = Vec::new();
+    for uid in &selected {
         let thread_id = format!("{folder}:{uid}");
-        if fetch.flags().contains(&imap::types::Flag::Deleted) {
-            let conn = state.db.lock().map_err(|e| e.to_string())?;
-            changed += delete_messages_by_thread(&conn, account.id, &thread_id)?;
-            continue;
-        }
-        let is_read = fetch.flags().contains(&imap::types::Flag::Seen);
         if existing_threads.contains(&thread_id) {
+            existing_uids.push(*uid);
+        } else {
+            missing_uids.push(*uid);
+        }
+    }
+
+    let mut changed = 0;
+    if !existing_uids.is_empty() {
+        let set = existing_uids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let fetches = session
+            .uid_fetch(set, "(FLAGS)")
+            .map_err(|e| e.to_string())?;
+        for fetch in fetches.iter() {
+            let uid = fetch.uid.unwrap_or(fetch.message);
+            let thread_id = format!("{folder}:{uid}");
+            if fetch.flags().contains(&imap::types::Flag::Deleted) {
+                let conn = state.db.lock().map_err(|e| e.to_string())?;
+                changed += delete_messages_by_thread(&conn, account.id, &thread_id)?;
+                continue;
+            }
+            let is_read = fetch.flags().contains(&imap::types::Flag::Seen);
             let conn = state.db.lock().map_err(|e| e.to_string())?;
             if update_message_read_by_thread(&conn, account.id, &thread_id, is_read)? {
                 changed += 1;
             }
-        } else {
-            missing_uids.push(uid);
         }
     }
 
@@ -2363,9 +2299,22 @@ fn sync_imap_messages(
             };
             let mut upstream_threads = HashSet::new();
             let mut missing_uids = Vec::new();
-            let mut flag_checked = 0;
+            let mut existing_uids = Vec::new();
 
-            for chunk in selected.chunks(chunk_size) {
+            for uid in &selected {
+                let thread_id = format!("{folder}:{uid}");
+                upstream_threads.insert(thread_id.clone());
+                if existing_threads.contains(&thread_id) {
+                    existing_uids.push(*uid);
+                } else {
+                    missing_uids.push(*uid);
+                }
+            }
+
+            let mut flag_checked = 0;
+            let mut deleted_existing = 0;
+
+            for chunk in existing_uids.chunks(chunk_size) {
                 let set = chunk
                     .iter()
                     .map(ToString::to_string)
@@ -2378,35 +2327,36 @@ fn sync_imap_messages(
                     let uid = fetch.uid.unwrap_or(fetch.message);
                     let thread_id = format!("{folder}:{uid}");
                     if fetch.flags().contains(&imap::types::Flag::Deleted) {
+                        upstream_threads.remove(&thread_id);
+                        let conn = state.db.lock().map_err(|e| e.to_string())?;
+                        deleted_existing +=
+                            delete_messages_by_thread(&conn, account.id, &thread_id)?;
                         flag_checked += 1;
                         continue;
                     }
-                    upstream_threads.insert(thread_id.clone());
                     let is_read = fetch.flags().contains(&imap::types::Flag::Seen);
-                    if existing_threads.contains(&thread_id) {
-                        let conn = state.db.lock().map_err(|e| e.to_string())?;
-                        conn.execute(
-                            "UPDATE messages SET is_read = ?, updated_at = ? WHERE account_id = ? AND thread_id = ?",
-                            params![if is_read { 1 } else { 0 }, now_ts(), account.id, thread_id],
-                        )
-                        .map_err(|e| e.to_string())?;
-                    } else {
-                        missing_uids.push(uid);
-                    }
+                    let conn = state.db.lock().map_err(|e| e.to_string())?;
+                    conn.execute(
+                        "UPDATE messages SET is_read = ?, updated_at = ? WHERE account_id = ? AND thread_id = ?",
+                        params![if is_read { 1 } else { 0 }, now_ts(), account.id, thread_id],
+                    )
+                    .map_err(|e| e.to_string())?;
                     flag_checked += 1;
                 }
             }
             let removed = {
                 let conn = state.db.lock().map_err(|e| e.to_string())?;
-                delete_missing_thread_ids(&conn, account.id, role, &upstream_threads)?
+                deleted_existing
+                    + delete_missing_thread_ids(&conn, account.id, role, &upstream_threads)?
             };
             if let Some(app) = app {
                 debug(
                     app,
                     format!(
-                        "IMAP sync compare email={} folder={} upstream={} new={} removed={removed}",
+                        "IMAP sync compare email={} folder={} upstream={} flags={} new={} removed={removed}",
                         account.email,
                         role,
+                        selected.len(),
                         flag_checked,
                         missing_uids.len()
                     ),
@@ -2491,10 +2441,7 @@ fn imap_to_message(
     let from_addr = parsed.headers.get_first_value("From").unwrap_or_default();
     let to_addr = parsed.headers.get_first_value("To").unwrap_or_default();
     let cc_addr = parsed.headers.get_first_value("Cc").unwrap_or_default();
-    let provider_message_id = parsed
-        .headers
-        .get_first_value("Message-ID")
-        .unwrap_or_else(|| format!("{folder}:{uid}"));
+    let message_id = parsed.headers.get_first_value("Message-ID");
     let date_ts = parsed
         .headers
         .get_first_value("Date")
@@ -2505,7 +2452,7 @@ fn imap_to_message(
     let attachments = parsed_attachments(&parsed);
     let snippet = snippet_for_body(&body, &body_mime);
     Ok(NewMessage {
-        provider_message_id: imap_provider_message_id(folder, uid, &provider_message_id),
+        provider_message_id: imap_provider_message_id(folder, uid, message_id.as_deref()),
         thread_id: format!("{folder}:{uid}"),
         folder: role.to_string(),
         subject,
@@ -2604,13 +2551,12 @@ fn remove_html_blocks(value: &str, tags: &[&str]) -> String {
     output
 }
 
-fn imap_provider_message_id(folder: &str, uid: u32, message_id: &str) -> String {
-    let message_id = message_id.trim();
-    if message_id.is_empty() {
-        format!("imap-uid:{folder}:{uid}")
-    } else {
-        format!("imap-message:{message_id}")
-    }
+fn imap_provider_message_id(folder: &str, uid: u32, message_id: Option<&str>) -> String {
+    let base = format!("imap-uid:{folder}:{uid}");
+    let Some(message_id) = message_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return base;
+    };
+    format!("{base}:{message_id}")
 }
 
 fn parsed_body(part: &mailparse::ParsedMail<'_>) -> (String, String) {
