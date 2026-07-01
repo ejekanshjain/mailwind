@@ -336,14 +336,6 @@ fn init_db(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Err
             created_at INTEGER NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS sync_cursors (
-            account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-            folder TEXT NOT NULL,
-            cursor TEXT,
-            updated_at INTEGER NOT NULL,
-            PRIMARY KEY(account_id, folder)
-        );
-
         CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
             subject,
             from_addr,
@@ -542,7 +534,7 @@ fn delete_message_row(conn: &Connection, id: i64) -> AppResult<()> {
 }
 
 fn is_local_sent_id(provider_message_id: &str) -> bool {
-    provider_message_id.starts_with("local-sent-") || provider_message_id.starts_with("local-sent:")
+    provider_message_id.starts_with("local-sent:")
 }
 
 fn delete_messages_by_thread(
@@ -579,7 +571,6 @@ fn existing_provider_ids(
             SELECT provider_message_id
             FROM messages
             WHERE account_id = ? AND folder = ?
-              AND provider_message_id NOT LIKE 'local-sent-%'
               AND provider_message_id NOT LIKE 'local-sent:%'
             ",
         )
@@ -602,7 +593,6 @@ fn existing_thread_ids(
             SELECT thread_id
             FROM messages
             WHERE account_id = ? AND folder = ?
-              AND provider_message_id NOT LIKE 'local-sent-%'
               AND provider_message_id NOT LIKE 'local-sent:%'
             ",
         )
@@ -626,7 +616,6 @@ fn delete_missing_provider_ids(
             SELECT id, provider_message_id
             FROM messages
             WHERE account_id = ? AND folder = ?
-              AND provider_message_id NOT LIKE 'local-sent-%'
               AND provider_message_id NOT LIKE 'local-sent:%'
             ",
         )
@@ -663,7 +652,6 @@ fn delete_missing_thread_ids(
             SELECT id, thread_id
             FROM messages
             WHERE account_id = ? AND folder = ?
-              AND provider_message_id NOT LIKE 'local-sent-%'
               AND provider_message_id NOT LIKE 'local-sent:%'
             ",
         )
@@ -3331,11 +3319,6 @@ fn update_imap_settings(
             password,
             input.account_id
         ],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute(
-        "DELETE FROM sync_cursors WHERE account_id = ?",
-        params![input.account_id],
     )
     .map_err(|e| e.to_string())?;
     debug(&app, "IMAP settings saved");

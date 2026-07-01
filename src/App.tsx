@@ -6,7 +6,6 @@ import {
   useRef,
   useState,
 } from "react";
-import { setTheme as setAppTheme } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
@@ -145,10 +144,7 @@ function applyNativeTheme(dark: boolean) {
   const theme = dark ? "dark" : "light";
   document.documentElement.style.colorScheme = theme;
   document.documentElement.classList.toggle("dark", dark);
-  void Promise.all([
-    setAppTheme(theme),
-    getCurrentWindow().setTheme(theme),
-  ]).catch(() => {
+  void getCurrentWindow().setTheme(theme).catch(() => {
     // Browser-only Vite previews do not have the Tauri window/app APIs.
   });
 }
