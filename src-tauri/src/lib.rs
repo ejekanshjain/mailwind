@@ -80,6 +80,10 @@ struct StoredMessage {
     account_id: i64,
     provider_message_id: String,
     thread_id: String,
+    message_header_id: String,
+    in_reply_to: String,
+    references_header: String,
+    normalized_subject: String,
     folder: String,
     subject: String,
     from_addr: String,
@@ -92,6 +96,8 @@ struct StoredMessage {
     is_read: bool,
     account_email: String,
     account_provider: String,
+    thread_count: i64,
+    thread_unread_count: i64,
     attachments: Vec<AttachmentSummary>,
 }
 
@@ -165,8 +171,10 @@ struct SendInput {
 
 #[derive(Debug, Clone)]
 struct ReplyContext {
-    provider_message_id: String,
+    account_id: i64,
     thread_id: String,
+    message_header_id: String,
+    references_header: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -189,6 +197,13 @@ struct RemoveAccountInput {
 struct MarkReadInput {
     message_id: i64,
     is_read: bool,
+    folder: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ThreadInput {
+    message_id: i64,
+    folder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,6 +221,10 @@ struct DownloadedAttachment {
 struct NewMessage {
     provider_message_id: String,
     thread_id: String,
+    message_header_id: String,
+    in_reply_to: String,
+    references_header: String,
+    normalized_subject: String,
     folder: String,
     subject: String,
     from_addr: String,
@@ -375,6 +394,10 @@ fn init_db(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Err
             account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
             provider_message_id TEXT NOT NULL,
             thread_id TEXT NOT NULL,
+            message_header_id TEXT NOT NULL DEFAULT '',
+            in_reply_to TEXT NOT NULL DEFAULT '',
+            references_header TEXT NOT NULL DEFAULT '',
+            normalized_subject TEXT NOT NULL DEFAULT '',
             folder TEXT NOT NULL,
             subject TEXT NOT NULL,
             from_addr TEXT NOT NULL,
@@ -425,8 +448,26 @@ fn init_db(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Err
             ON messages(account_id, folder, provider_message_id);
         CREATE INDEX IF NOT EXISTS idx_messages_account_folder_thread
             ON messages(account_id, folder, thread_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_folder_thread_date
+            ON messages(account_id, folder, thread_id, date_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_folder_account_thread_date
+            ON messages(folder, account_id, thread_id, date_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_folder_read_thread_date
+            ON messages(account_id, folder, is_read, thread_id, date_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_folder_read_account_thread_date
+            ON messages(folder, is_read, account_id, thread_id, date_ts DESC);
         CREATE INDEX IF NOT EXISTS idx_messages_account_thread
             ON messages(account_id, thread_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_thread_date
+            ON messages(account_id, thread_id, date_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_thread_folder_date
+            ON messages(account_id, thread_id, folder, date_ts ASC);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_subject
+            ON messages(account_id, normalized_subject);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_message_header
+            ON messages(account_id, message_header_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_in_reply_to
+            ON messages(account_id, in_reply_to);
         CREATE INDEX IF NOT EXISTS idx_messages_inbox_unread
             ON messages(folder, is_read)
             WHERE folder = 'Inbox' AND is_read = 0;
@@ -434,9 +475,153 @@ fn init_db(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Err
             ON attachments(message_id);
         ",
     )?;
+    ensure_message_metadata_columns(&conn)?;
+    backfill_message_metadata(&conn)?;
     conn.execute_batch("PRAGMA optimize;")?;
 
     Ok(conn)
+}
+
+fn ensure_message_metadata_columns(conn: &Connection) -> AppResult<()> {
+    let existing = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(messages)")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<HashSet<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+
+    for (name, sql_type) in [
+        ("message_header_id", "TEXT NOT NULL DEFAULT ''"),
+        ("in_reply_to", "TEXT NOT NULL DEFAULT ''"),
+        ("references_header", "TEXT NOT NULL DEFAULT ''"),
+        ("normalized_subject", "TEXT NOT NULL DEFAULT ''"),
+    ] {
+        if !existing.contains(name) {
+            conn.execute(
+                &format!("ALTER TABLE messages ADD COLUMN {name} {sql_type}"),
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_messages_account_thread_date
+            ON messages(account_id, thread_id, date_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_thread_folder_date
+            ON messages(account_id, thread_id, folder, date_ts ASC);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_folder_thread_date
+            ON messages(account_id, folder, thread_id, date_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_folder_account_thread_date
+            ON messages(folder, account_id, thread_id, date_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_folder_read_thread_date
+            ON messages(account_id, folder, is_read, thread_id, date_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_folder_read_account_thread_date
+            ON messages(folder, is_read, account_id, thread_id, date_ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_subject
+            ON messages(account_id, normalized_subject);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_message_header
+            ON messages(account_id, message_header_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_account_in_reply_to
+            ON messages(account_id, in_reply_to);
+        ",
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn backfill_message_metadata(conn: &Connection) -> AppResult<()> {
+    let rows = {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT id, provider_message_id, thread_id, subject,
+                       message_header_id, normalized_subject
+                FROM messages
+                WHERE message_header_id = ''
+                   OR normalized_subject = ''
+                   OR provider_message_id LIKE 'imap-uid:%'
+                ",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+
+    for (id, provider_message_id, current_thread_id, subject, header_id, normalized) in rows {
+        let clean_subject = clean_header_value(&subject);
+        let normalized_subject = if normalized.trim().is_empty() {
+            normalize_subject_key(&clean_subject)
+        } else {
+            normalized
+        };
+        let message_header_id = if header_id.trim().is_empty() {
+            message_header_id_from_provider_id(&provider_message_id).unwrap_or_default()
+        } else {
+            header_id
+        };
+        let thread_id = backfilled_conversation_id(
+            &provider_message_id,
+            &current_thread_id,
+            &normalized_subject,
+            &message_header_id,
+        );
+        conn.execute(
+            "
+            UPDATE messages
+            SET thread_id = ?, message_header_id = ?, normalized_subject = ?, subject = ?
+            WHERE id = ?
+            ",
+            params![
+                thread_id,
+                message_header_id,
+                normalized_subject,
+                clean_subject,
+                id
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn backfilled_conversation_id(
+    provider_message_id: &str,
+    current_thread_id: &str,
+    normalized_subject: &str,
+    message_header_id: &str,
+) -> String {
+    if provider_message_id.starts_with("imap-uid:") {
+        if !normalized_subject.is_empty() {
+            return format!("subject:{normalized_subject}");
+        }
+        if !message_header_id.is_empty() {
+            return format!("message:{}", message_header_id.to_ascii_lowercase());
+        }
+    }
+    if !current_thread_id.trim().is_empty() {
+        return current_thread_id.to_string();
+    }
+    if !normalized_subject.is_empty() {
+        return format!("subject:{normalized_subject}");
+    }
+    provider_message_id.to_string()
 }
 
 fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAccount> {
@@ -477,12 +662,17 @@ fn upsert_message(conn: &Connection, account_id: i64, msg: &NewMessage) -> AppRe
     conn.execute(
         "
         INSERT INTO messages (
-            account_id, provider_message_id, thread_id, folder, subject, from_addr, to_addr,
+            account_id, provider_message_id, thread_id, message_header_id, in_reply_to,
+            references_header, normalized_subject, folder, subject, from_addr, to_addr,
             cc_addr, date_ts, snippet, body, body_mime, is_read, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(account_id, provider_message_id) DO UPDATE SET
             thread_id = excluded.thread_id,
+            message_header_id = excluded.message_header_id,
+            in_reply_to = excluded.in_reply_to,
+            references_header = excluded.references_header,
+            normalized_subject = excluded.normalized_subject,
             folder = excluded.folder,
             subject = excluded.subject,
             from_addr = excluded.from_addr,
@@ -499,6 +689,10 @@ fn upsert_message(conn: &Connection, account_id: i64, msg: &NewMessage) -> AppRe
             account_id,
             msg.provider_message_id,
             msg.thread_id,
+            msg.message_header_id,
+            msg.in_reply_to,
+            msg.references_header,
+            msg.normalized_subject,
             msg.folder,
             msg.subject,
             msg.from_addr,
@@ -602,16 +796,26 @@ fn is_local_sent_id(provider_message_id: &str) -> bool {
     provider_message_id.starts_with("local-sent:")
 }
 
-fn delete_messages_by_thread(
+fn delete_messages_by_imap_location(
     conn: &Connection,
     account_id: i64,
-    thread_id: &str,
+    folder: &str,
+    uid: u32,
 ) -> AppResult<usize> {
+    let exact = imap_provider_message_id(folder, uid, None);
+    let like = format!("{exact}:%");
     let mut stmt = conn
-        .prepare("SELECT id FROM messages WHERE account_id = ? AND thread_id = ?")
+        .prepare(
+            "
+            SELECT id
+            FROM messages
+            WHERE account_id = ?
+              AND (provider_message_id = ? OR provider_message_id LIKE ?)
+            ",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(params![account_id, thread_id], |row| row.get::<_, i64>(0))
+        .query_map(params![account_id, exact, like], |row| row.get::<_, i64>(0))
         .map_err(|e| e.to_string())?;
     let ids = rows
         .collect::<Result<Vec<_>, _>>()
@@ -623,6 +827,45 @@ fn delete_messages_by_thread(
         delete_message_row(conn, id)?;
     }
     Ok(count)
+}
+
+fn update_message_read_by_imap_location(
+    conn: &Connection,
+    account_id: i64,
+    folder: &str,
+    uid: u32,
+    is_read: bool,
+) -> AppResult<bool> {
+    let exact = imap_provider_message_id(folder, uid, None);
+    let like = format!("{exact}:%");
+    let current = conn
+        .query_row(
+            "
+            SELECT is_read
+            FROM messages
+            WHERE account_id = ?
+              AND (provider_message_id = ? OR provider_message_id LIKE ?)
+            ",
+            params![account_id, exact, like],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let next = if is_read { 1 } else { 0 };
+    if current != Some(next) {
+        conn.execute(
+            "
+            UPDATE messages
+            SET is_read = ?, updated_at = ?
+            WHERE account_id = ?
+              AND (provider_message_id = ? OR provider_message_id LIKE ?)
+            ",
+            params![next, now_ts(), account_id, exact, like],
+        )
+        .map_err(|e| e.to_string())?;
+        return Ok(current.is_some());
+    }
+    Ok(false)
 }
 
 fn existing_provider_ids(
@@ -647,7 +890,7 @@ fn existing_provider_ids(
         .map_err(|e| e.to_string())
 }
 
-fn existing_thread_ids(
+fn existing_imap_location_ids(
     conn: &Connection,
     account_id: i64,
     folder: &str,
@@ -655,18 +898,23 @@ fn existing_thread_ids(
     let mut stmt = conn
         .prepare(
             "
-            SELECT thread_id
+            SELECT provider_message_id
             FROM messages
             WHERE account_id = ? AND folder = ?
-              AND provider_message_id NOT LIKE 'local-sent:%'
+              AND provider_message_id LIKE 'imap-uid:%'
             ",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![account_id, folder], |row| row.get::<_, String>(0))
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<HashSet<_>, _>>()
-        .map_err(|e| e.to_string())
+    let provider_ids = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(provider_ids
+        .iter()
+        .filter_map(|provider_id| imap_location_from_provider_id(provider_id))
+        .collect())
 }
 
 fn delete_missing_provider_ids(
@@ -705,7 +953,7 @@ fn delete_missing_provider_ids(
     Ok(removed)
 }
 
-fn delete_missing_thread_ids(
+fn delete_missing_imap_location_ids(
     conn: &Connection,
     account_id: i64,
     folder: &str,
@@ -714,10 +962,10 @@ fn delete_missing_thread_ids(
     let mut stmt = conn
         .prepare(
             "
-            SELECT id, thread_id
+            SELECT id, provider_message_id
             FROM messages
             WHERE account_id = ? AND folder = ?
-              AND provider_message_id NOT LIKE 'local-sent:%'
+              AND provider_message_id LIKE 'imap-uid:%'
             ",
         )
         .map_err(|e| e.to_string())?;
@@ -732,10 +980,12 @@ fn delete_missing_thread_ids(
     drop(stmt);
 
     let mut removed = 0;
-    for (id, thread_id) in local_rows {
-        if !upstream_ids.contains(&thread_id) {
-            delete_message_row(conn, id)?;
-            removed += 1;
+    for (id, provider_id) in local_rows {
+        if let Some(location) = imap_location_from_provider_id(&provider_id) {
+            if !upstream_ids.contains(&location) {
+                delete_message_row(conn, id)?;
+                removed += 1;
+            }
         }
     }
     Ok(removed)
@@ -897,34 +1147,53 @@ fn list_messages(
         fts_query,
     );
 
-    let sql = if query.trim().is_empty() {
-        format!(
-            "
-        SELECT m.id, m.account_id, m.provider_message_id, m.thread_id, m.folder, m.subject,
-               m.from_addr, m.to_addr, m.cc_addr, m.date_ts, m.snippet, m.body, m.body_mime, m.is_read,
-               a.email, a.provider
-        FROM messages m
-        JOIN accounts a ON a.id = m.account_id
-        WHERE {where_sql}
-        ORDER BY m.date_ts DESC
-        LIMIT ? OFFSET ?
-        "
-        )
+    let filtered_sql = if query.trim().is_empty() {
+        format!("SELECT m.* FROM messages m WHERE {where_sql}")
     } else {
         format!(
             "
-        SELECT m.id, m.account_id, m.provider_message_id, m.thread_id, m.folder, m.subject,
-               m.from_addr, m.to_addr, m.cc_addr, m.date_ts, m.snippet, m.body, m.body_mime, m.is_read,
-               a.email, a.provider
-        FROM messages_fts f
-        JOIN messages m ON m.id = f.rowid
-        JOIN accounts a ON a.id = m.account_id
-        WHERE {where_sql}
-        ORDER BY m.date_ts DESC
-        LIMIT ? OFFSET ?
-        "
+            SELECT m.*
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            WHERE {where_sql}
+            "
         )
     };
+    let sql = format!(
+        "
+        WITH filtered AS ({filtered_sql}),
+             grouped AS (
+                SELECT account_id, thread_id,
+                       COUNT(*) AS thread_count,
+                       COALESCE(SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END), 0) AS thread_unread_count
+                FROM filtered
+                GROUP BY account_id, thread_id
+             ),
+             picked AS (
+                SELECT (
+                    SELECT id
+                    FROM filtered f
+                    WHERE f.account_id = grouped.account_id
+                      AND f.thread_id = grouped.thread_id
+                    ORDER BY date_ts DESC, id DESC
+                    LIMIT 1
+                ) AS id,
+                thread_count,
+                thread_unread_count
+                FROM grouped
+             )
+        SELECT m.id, m.account_id, m.provider_message_id, m.thread_id,
+               m.message_header_id, m.in_reply_to, m.references_header, m.normalized_subject,
+               m.folder, m.subject, m.from_addr, m.to_addr, m.cc_addr, m.date_ts, m.snippet,
+               m.body, m.body_mime, m.is_read, a.email, a.provider,
+               picked.thread_count, picked.thread_unread_count
+        FROM picked
+        JOIN messages m ON m.id = picked.id
+        JOIN accounts a ON a.id = m.account_id
+        ORDER BY m.date_ts DESC, m.id DESC
+        LIMIT ? OFFSET ?
+        "
+    );
 
     sql_params.push(SqlValue::Integer(page_size));
     sql_params.push(SqlValue::Integer(offset));
@@ -932,26 +1201,7 @@ fn list_messages(
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(sql_params.iter()), |row| {
-            let id = row.get(0)?;
-            Ok(StoredMessage {
-                id,
-                account_id: row.get(1)?,
-                provider_message_id: row.get(2)?,
-                thread_id: row.get(3)?,
-                folder: row.get(4)?,
-                subject: row.get(5)?,
-                from_addr: row.get(6)?,
-                to_addr: row.get(7)?,
-                cc_addr: row.get(8)?,
-                date_ts: row.get(9)?,
-                snippet: row.get(10)?,
-                body: row.get(11)?,
-                body_mime: row.get(12)?,
-                is_read: row.get::<_, i64>(13)? == 1,
-                account_email: row.get(14)?,
-                account_provider: row.get(15)?,
-                attachments: Vec::new(),
-            })
+            stored_message_from_row(row, Some((20, 21)))
         })
         .map_err(|e| e.to_string())?;
 
@@ -971,6 +1221,110 @@ fn list_messages(
     Ok(messages)
 }
 
+#[tauri::command]
+fn list_thread_messages(
+    state: State<'_, AppState>,
+    input: ThreadInput,
+) -> AppResult<Vec<StoredMessage>> {
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let (account_id, thread_id): (i64, String) = conn
+        .query_row(
+            "SELECT account_id, thread_id FROM messages WHERE id = ?",
+            params![input.message_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Message not found".to_string())?;
+    let folder_scope = match input.folder.as_deref() {
+        Some("Trash") => "AND m.folder = 'Trash'",
+        Some(_) => "AND m.folder <> 'Trash'",
+        std::option::Option::None => "",
+    };
+    let sql = format!(
+        "
+        WITH thread_messages AS (
+            SELECT m.id, m.account_id, m.provider_message_id, m.thread_id,
+                   m.message_header_id, m.in_reply_to, m.references_header, m.normalized_subject,
+                   m.folder, m.subject, m.from_addr, m.to_addr, m.cc_addr, m.date_ts, m.snippet,
+                   m.body, m.body_mime, m.is_read, a.email, a.provider
+            FROM messages m
+            JOIN accounts a ON a.id = m.account_id
+            WHERE m.account_id = ? AND m.thread_id = ?
+            {folder_scope}
+        ),
+        thread_stats AS (
+            SELECT COUNT(*) AS thread_count,
+                   COALESCE(SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END), 0) AS thread_unread_count
+            FROM thread_messages
+        )
+        SELECT tm.id, tm.account_id, tm.provider_message_id, tm.thread_id,
+               tm.message_header_id, tm.in_reply_to, tm.references_header, tm.normalized_subject,
+               tm.folder, tm.subject, tm.from_addr, tm.to_addr, tm.cc_addr, tm.date_ts, tm.snippet,
+               tm.body, tm.body_mime, tm.is_read, tm.email, tm.provider,
+               thread_stats.thread_count, thread_stats.thread_unread_count
+        FROM thread_messages tm
+        CROSS JOIN thread_stats
+        ORDER BY tm.date_ts ASC, tm.id ASC
+        "
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![account_id, thread_id], |row| {
+            stored_message_from_row(row, Some((20, 21)))
+        })
+        .map_err(|e| e.to_string())?;
+    let mut messages = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let attachments = list_attachments_for_messages(
+        &conn,
+        &messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>(),
+    )?;
+    for message in &mut messages {
+        message.attachments = attachments.get(&message.id).cloned().unwrap_or_default();
+    }
+    Ok(messages)
+}
+
+fn stored_message_from_row(
+    row: &rusqlite::Row<'_>,
+    count_columns: Option<(usize, usize)>,
+) -> rusqlite::Result<StoredMessage> {
+    let (thread_count, thread_unread_count) = match count_columns {
+        Some((count_column, unread_column)) => (row.get(count_column)?, row.get(unread_column)?),
+        std::option::Option::None => (1, if row.get::<_, i64>(17)? == 0 { 1 } else { 0 }),
+    };
+    Ok(StoredMessage {
+        id: row.get(0)?,
+        account_id: row.get(1)?,
+        provider_message_id: row.get(2)?,
+        thread_id: row.get(3)?,
+        message_header_id: row.get(4)?,
+        in_reply_to: row.get(5)?,
+        references_header: row.get(6)?,
+        normalized_subject: row.get(7)?,
+        folder: row.get(8)?,
+        subject: row.get(9)?,
+        from_addr: row.get(10)?,
+        to_addr: row.get(11)?,
+        cc_addr: row.get(12)?,
+        date_ts: row.get(13)?,
+        snippet: row.get(14)?,
+        body: row.get(15)?,
+        body_mime: row.get(16)?,
+        is_read: row.get::<_, i64>(17)? == 1,
+        account_email: row.get(18)?,
+        account_provider: row.get(19)?,
+        thread_count,
+        thread_unread_count,
+        attachments: Vec::new(),
+    })
+}
+
 fn count_messages(state: State<'_, AppState>, filter: &MessageFilter) -> AppResult<i64> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     let query = filter.query.clone().unwrap_or_default();
@@ -981,24 +1335,29 @@ fn count_messages(state: State<'_, AppState>, filter: &MessageFilter) -> AppResu
         read_filter,
         fts_query_value(&query),
     );
-    let sql = if query.trim().is_empty() {
-        format!(
-            "
-        SELECT COUNT(*)
-        FROM messages m
-        WHERE {where_sql}
-        "
-        )
+    let filtered_sql = if query.trim().is_empty() {
+        format!("SELECT m.account_id, m.thread_id FROM messages m WHERE {where_sql}")
     } else {
         format!(
             "
-        SELECT COUNT(*)
-        FROM messages_fts f
-        JOIN messages m ON m.id = f.rowid
-        WHERE {where_sql}
-        "
+            SELECT m.account_id, m.thread_id
+            FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            WHERE {where_sql}
+            "
         )
     };
+    let sql = format!(
+        "
+        WITH filtered AS ({filtered_sql})
+        SELECT COUNT(*)
+        FROM (
+            SELECT account_id, thread_id
+            FROM filtered
+            GROUP BY account_id, thread_id
+        )
+        "
+    );
     conn.query_row(&sql, rusqlite::params_from_iter(sql_params.iter()), |row| {
         row.get(0)
     })
@@ -1822,21 +2181,21 @@ fn poll_imap_inbox(
     if selected.is_empty() {
         let removed = {
             let conn = state.db.lock().map_err(|e| e.to_string())?;
-            delete_missing_thread_ids(&conn, account.id, "Inbox", &HashSet::new())?
+            delete_missing_imap_location_ids(&conn, account.id, "Inbox", &HashSet::new())?
         };
         session.logout().ok();
         return Ok((0, removed));
     }
 
-    let existing_threads = {
+    let existing_locations = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        existing_thread_ids(&conn, account.id, "Inbox")?
+        existing_imap_location_ids(&conn, account.id, "Inbox")?
     };
     let mut missing_uids = Vec::new();
     let mut existing_uids = Vec::new();
     for uid in &selected {
-        let thread_id = format!("{folder}:{uid}");
-        if existing_threads.contains(&thread_id) {
+        let location_id = imap_location_key(folder, *uid);
+        if existing_locations.contains(&location_id) {
             existing_uids.push(*uid);
         } else {
             missing_uids.push(*uid);
@@ -1966,23 +2325,6 @@ fn update_message_read_by_provider(
         provider_message_id,
         is_read,
     )
-}
-
-fn update_message_read_by_thread(
-    conn: &Connection,
-    account_id: i64,
-    thread_id: &str,
-    is_read: bool,
-) -> AppResult<bool> {
-    let current = conn
-        .query_row(
-            "SELECT is_read FROM messages WHERE account_id = ? AND thread_id = ?",
-            params![account_id, thread_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    update_read_if_changed(conn, current, "thread_id", account_id, thread_id, is_read)
 }
 
 fn update_read_if_changed(
@@ -2226,6 +2568,14 @@ fn gmail_to_message(folder: &str, raw: &Value) -> NewMessage {
     let from_addr = gmail_header(payload, "From").unwrap_or_default();
     let to_addr = gmail_header(payload, "To").unwrap_or_default();
     let cc_addr = gmail_header(payload, "Cc").unwrap_or_default();
+    let message_header_id = gmail_header(payload, "Message-ID")
+        .as_deref()
+        .and_then(normalize_message_id)
+        .unwrap_or_default();
+    let in_reply_to = normalize_message_id_header(gmail_header(payload, "In-Reply-To").as_deref());
+    let references_header =
+        normalize_message_id_header(gmail_header(payload, "References").as_deref());
+    let normalized_subject = normalize_subject_key(&subject);
     let date_ts = gmail_header(payload, "Date")
         .and_then(|date| DateTime::parse_from_rfc2822(&date).ok())
         .map(|date| date.timestamp())
@@ -2253,8 +2603,21 @@ fn gmail_to_message(folder: &str, raw: &Value) -> NewMessage {
         thread_id: raw
             .get("threadId")
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+            .map(ToString::to_string)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| {
+                conversation_id_from_headers(
+                    &message_header_id,
+                    &in_reply_to,
+                    &references_header,
+                    &normalized_subject,
+                    raw.get("id").and_then(Value::as_str).unwrap_or_default(),
+                )
+            }),
+        message_header_id,
+        in_reply_to,
+        references_header,
+        normalized_subject,
         folder: folder.to_string(),
         subject,
         from_addr,
@@ -2286,7 +2649,7 @@ fn gmail_header(payload: &Value, name: &str) -> Option<String> {
                 .unwrap_or(false)
         })
         .and_then(|header| header.get("value").and_then(Value::as_str))
-        .map(ToString::to_string)
+        .map(clean_header_value)
 }
 
 fn gmail_body(payload: &Value) -> (String, String) {
@@ -2398,7 +2761,7 @@ fn sync_imap_messages(
             if selected.is_empty() {
                 let removed = {
                     let conn = state.db.lock().map_err(|e| e.to_string())?;
-                    delete_missing_thread_ids(&conn, account.id, role, &HashSet::new())?
+                    delete_missing_imap_location_ids(&conn, account.id, role, &HashSet::new())?
                 };
                 if let Some(app) = app {
                     debug(
@@ -2422,18 +2785,18 @@ fn sync_imap_messages(
                     ),
                 );
             }
-            let existing_threads = {
+            let existing_locations = {
                 let conn = state.db.lock().map_err(|e| e.to_string())?;
-                existing_thread_ids(&conn, account.id, role)?
+                existing_imap_location_ids(&conn, account.id, role)?
             };
-            let mut upstream_threads = HashSet::new();
+            let mut upstream_locations = HashSet::new();
             let mut missing_uids = Vec::new();
             let mut existing_uids = Vec::new();
 
             for uid in &selected {
-                let thread_id = format!("{folder}:{uid}");
-                upstream_threads.insert(thread_id.clone());
-                if existing_threads.contains(&thread_id) {
+                let location_id = imap_location_key(folder, *uid);
+                upstream_locations.insert(location_id.clone());
+                if existing_locations.contains(&location_id) {
                     existing_uids.push(*uid);
                 } else {
                     missing_uids.push(*uid);
@@ -2469,7 +2832,7 @@ fn sync_imap_messages(
                                             account,
                                             folder,
                                             fetch,
-                                            Some(&mut upstream_threads),
+                                            Some(&mut upstream_locations),
                                         )?;
                                         flag_checked += checked;
                                         deleted_existing += deleted;
@@ -2500,7 +2863,7 @@ fn sync_imap_messages(
                         account,
                         folder,
                         fetch,
-                        Some(&mut upstream_threads),
+                        Some(&mut upstream_locations),
                     )?;
                     flag_checked += checked;
                     deleted_existing += deleted;
@@ -2509,7 +2872,12 @@ fn sync_imap_messages(
             let removed = {
                 let conn = state.db.lock().map_err(|e| e.to_string())?;
                 deleted_existing
-                    + delete_missing_thread_ids(&conn, account.id, role, &upstream_threads)?
+                    + delete_missing_imap_location_ids(
+                        &conn,
+                        account.id,
+                        role,
+                        &upstream_locations,
+                    )?
             };
             if let Some(app) = app {
                 debug(
@@ -2650,22 +3018,23 @@ fn apply_imap_flag_fetch(
     account: &StoredAccount,
     folder: &str,
     fetch: &imap::types::Fetch,
-    upstream_threads: Option<&mut HashSet<String>>,
+    upstream_locations: Option<&mut HashSet<String>>,
 ) -> AppResult<(usize, usize, usize)> {
     let uid = fetch.uid.unwrap_or(fetch.message);
-    let thread_id = format!("{folder}:{uid}");
+    let location_id = imap_location_key(folder, uid);
     if fetch.flags().contains(&imap::types::Flag::Deleted) {
-        if let Some(upstream_threads) = upstream_threads {
-            upstream_threads.remove(&thread_id);
+        if let Some(upstream_locations) = upstream_locations {
+            upstream_locations.remove(&location_id);
         }
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let deleted = delete_messages_by_thread(&conn, account.id, &thread_id)?;
+        let deleted = delete_messages_by_imap_location(&conn, account.id, folder, uid)?;
         return Ok((1, deleted, deleted));
     }
 
     let is_read = fetch.flags().contains(&imap::types::Flag::Seen);
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let changed = if update_message_read_by_thread(&conn, account.id, &thread_id, is_read)? {
+    let changed = if update_message_read_by_imap_location(&conn, account.id, folder, uid, is_read)?
+    {
         1
     } else {
         0
@@ -2763,14 +3132,18 @@ fn imap_to_message(
     is_read: bool,
 ) -> AppResult<NewMessage> {
     let parsed = mailparse::parse_mail(raw).map_err(|e| e.to_string())?;
-    let subject = parsed
-        .headers
-        .get_first_value("Subject")
-        .unwrap_or_else(|| "(no subject)".to_string());
-    let from_addr = parsed.headers.get_first_value("From").unwrap_or_default();
-    let to_addr = parsed.headers.get_first_value("To").unwrap_or_default();
-    let cc_addr = parsed.headers.get_first_value("Cc").unwrap_or_default();
-    let message_id = parsed.headers.get_first_value("Message-ID");
+    let subject = parsed_header(&parsed, "Subject").unwrap_or_else(|| "(no subject)".to_string());
+    let from_addr = parsed_header(&parsed, "From").unwrap_or_default();
+    let to_addr = parsed_header(&parsed, "To").unwrap_or_default();
+    let cc_addr = parsed_header(&parsed, "Cc").unwrap_or_default();
+    let message_header_id = parsed_header(&parsed, "Message-ID")
+        .as_deref()
+        .and_then(normalize_message_id)
+        .unwrap_or_default();
+    let in_reply_to = normalize_message_id_header(parsed_header(&parsed, "In-Reply-To").as_deref());
+    let references_header =
+        normalize_message_id_header(parsed_header(&parsed, "References").as_deref());
+    let normalized_subject = normalize_subject_key(&subject);
     let date_ts = parsed
         .headers
         .get_first_value("Date")
@@ -2781,8 +3154,18 @@ fn imap_to_message(
     let attachments = parsed_attachments(&parsed);
     let snippet = snippet_for_body(&body, &body_mime);
     Ok(NewMessage {
-        provider_message_id: imap_provider_message_id(folder, uid, message_id.as_deref()),
-        thread_id: format!("{folder}:{uid}"),
+        provider_message_id: imap_provider_message_id(folder, uid, nonempty(&message_header_id)),
+        thread_id: conversation_id_from_headers(
+            &message_header_id,
+            &in_reply_to,
+            &references_header,
+            &normalized_subject,
+            &format!("imap-location:{folder}:{uid}"),
+        ),
+        message_header_id,
+        in_reply_to,
+        references_header,
+        normalized_subject,
         folder: role.to_string(),
         subject,
         from_addr,
@@ -2795,6 +3178,155 @@ fn imap_to_message(
         is_read,
         attachments,
     })
+}
+
+fn parsed_header(parsed: &mailparse::ParsedMail<'_>, name: &str) -> Option<String> {
+    parsed
+        .headers
+        .get_first_value(name)
+        .map(|value| clean_header_value(value.as_str()))
+}
+
+fn clean_header_value(value: &str) -> String {
+    let mut cleaned = value.replace(['\r', '\n', '\t'], " ");
+    for pattern in [
+        "?==?utf-8?q?",
+        "?==?utf-8?b?",
+        "=?utf-8?q?",
+        "=?utf-8?b?",
+        "?==?",
+        "?=",
+    ] {
+        cleaned = replace_case_insensitive(&cleaned, pattern, " ");
+    }
+    collapse_spaces(&cleaned)
+}
+
+fn replace_case_insensitive(value: &str, pattern: &str, replacement: &str) -> String {
+    let mut output = String::new();
+    let lower_value = value.to_ascii_lowercase();
+    let lower_pattern = pattern.to_ascii_lowercase();
+    let mut offset = 0;
+    while let Some(relative) = lower_value
+        .get(offset..)
+        .and_then(|tail| tail.find(&lower_pattern))
+    {
+        let start = offset + relative;
+        let Some(before_match) = value.get(offset..start) else {
+            output.push_str(value.get(offset..).unwrap_or_default());
+            return output;
+        };
+        output.push_str(before_match);
+        output.push_str(replacement);
+        offset = start + pattern.len();
+    }
+    output.push_str(value.get(offset..).unwrap_or_default());
+    output
+}
+
+fn collapse_spaces(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalize_subject_key(subject: &str) -> String {
+    let mut value = clean_header_value(subject);
+    loop {
+        let trimmed = value.trim_start();
+        let lowered = trimmed.to_ascii_lowercase();
+        let prefix = ["re:", "fw:", "fwd:"]
+            .iter()
+            .find(|prefix| lowered.starts_with(**prefix));
+        if let Some(prefix) = prefix {
+            value = trimmed
+                .get(prefix.len()..)
+                .unwrap_or_default()
+                .trim_start()
+                .to_string();
+        } else {
+            break;
+        }
+    }
+    clean_header_value(&value).to_ascii_lowercase()
+}
+
+fn normalize_message_id_header(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    parse_message_ids(value).join(" ")
+}
+
+fn normalize_message_id(value: &str) -> Option<String> {
+    parse_message_ids(value).into_iter().next()
+}
+
+fn parse_message_ids(value: &str) -> Vec<String> {
+    if let Ok(ids) = mailparse::msgidparse(value) {
+        return ids.iter().map(|id| format!("<{}>", id.trim())).collect();
+    }
+
+    let mut ids = Vec::new();
+    let mut rest = value;
+    while let Some(start) = rest.find('<') {
+        let Some(after_start) = rest.get(start + 1..) else {
+            break;
+        };
+        let Some(end) = after_start.find('>') else {
+            break;
+        };
+        let id = after_start.get(..end).unwrap_or_default().trim();
+        if !id.is_empty() {
+            ids.push(format!("<{id}>"));
+        }
+        let Some(next_rest) = after_start.get(end + 1..) else {
+            break;
+        };
+        rest = next_rest;
+    }
+    ids
+}
+
+fn conversation_id_from_headers(
+    message_header_id: &str,
+    in_reply_to: &str,
+    references_header: &str,
+    normalized_subject: &str,
+    fallback: &str,
+) -> String {
+    let references = parse_message_ids(references_header);
+    if let Some(root) = references.first() {
+        return format!("message:{}", root.to_ascii_lowercase());
+    }
+    let reply_ids = parse_message_ids(in_reply_to);
+    if let Some(parent) = reply_ids.first() {
+        return format!("message:{}", parent.to_ascii_lowercase());
+    }
+    if !message_header_id.trim().is_empty() {
+        return format!("message:{}", message_header_id.trim().to_ascii_lowercase());
+    }
+    if !normalized_subject.trim().is_empty() {
+        return format!("subject:{}", normalized_subject.trim());
+    }
+    fallback.to_string()
+}
+
+fn message_header_id_from_provider_id(provider_message_id: &str) -> Option<String> {
+    if let Some(message_id) = provider_message_id.strip_prefix("local-sent:") {
+        return normalize_message_id(message_id);
+    }
+    if !provider_message_id.starts_with("imap-uid:") {
+        return None;
+    }
+    let (_, _, message_id) = parse_imap_provider_message_id_parts(provider_message_id)?;
+    message_id.and_then(normalize_message_id)
+}
+
+fn nonempty(value: &str) -> Option<&str> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn snippet_for_body(body: &str, body_mime: &str) -> String {
@@ -2886,6 +3418,26 @@ fn imap_provider_message_id(folder: &str, uid: u32, message_id: Option<&str>) ->
         return base;
     };
     format!("{base}:{message_id}")
+}
+
+fn imap_location_key(folder: &str, uid: u32) -> String {
+    format!("{folder}:{uid}")
+}
+
+fn imap_location_from_provider_id(provider_message_id: &str) -> Option<String> {
+    let (folder, uid, _) = parse_imap_provider_message_id_parts(provider_message_id)?;
+    Some(imap_location_key(&folder, uid))
+}
+
+fn parse_imap_provider_message_id_parts(
+    provider_message_id: &str,
+) -> Option<(String, u32, Option<&str>)> {
+    let rest = provider_message_id.strip_prefix("imap-uid:")?;
+    let mut parts = rest.splitn(3, ':');
+    let folder = parts.next()?.to_string();
+    let uid = parts.next()?.parse::<u32>().ok()?;
+    let message_id = parts.next().filter(|value| !value.trim().is_empty());
+    Some((folder, uid, message_id))
 }
 
 fn parsed_body(part: &mailparse::ParsedMail<'_>) -> (String, String) {
@@ -2996,8 +3548,18 @@ fn run_send_message(app: &tauri::AppHandle, input: SendInput) -> AppResult<Store
             .as_ref()
             .map(|reply| reply.thread_id.clone())
             .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        message_header_id: sent_message_id.clone(),
+        in_reply_to: reply_context
+            .as_ref()
+            .map(|reply| reply.message_header_id.clone())
+            .unwrap_or_default(),
+        references_header: reply_context
+            .as_ref()
+            .map(reply_references_header)
+            .unwrap_or_default(),
+        normalized_subject: normalize_subject_key(&input.subject),
         folder: "Sent".to_string(),
-        subject: input.subject,
+        subject: clean_header_value(&input.subject),
         from_addr: account.email.clone(),
         to_addr: input.to,
         cc_addr: String::new(),
@@ -3024,6 +3586,10 @@ fn run_send_message(app: &tauri::AppHandle, input: SendInput) -> AppResult<Store
         account_id: account.id,
         provider_message_id: sent.provider_message_id,
         thread_id: sent.thread_id,
+        message_header_id: sent.message_header_id,
+        in_reply_to: sent.in_reply_to,
+        references_header: sent.references_header,
+        normalized_subject: sent.normalized_subject,
         folder: sent.folder,
         subject: sent.subject,
         from_addr: sent.from_addr,
@@ -3036,6 +3602,8 @@ fn run_send_message(app: &tauri::AppHandle, input: SendInput) -> AppResult<Store
         is_read: true,
         account_email: account.email,
         account_provider: account.provider,
+        thread_count: 1,
+        thread_unread_count: 0,
         attachments: Vec::new(),
     })
 }
@@ -3050,7 +3618,7 @@ fn send_gmail(
     let encoded = general_purpose::URL_SAFE_NO_PAD.encode(outbound.formatted());
     let mut body = serde_json::Map::new();
     body.insert("raw".to_string(), Value::String(encoded));
-    if let Some(reply_context) = reply_context {
+    if let Some(reply_context) = reply_context.filter(|reply| reply.account_id == account.id) {
         body.insert(
             "threadId".to_string(),
             Value::String(reply_context.thread_id.clone()),
@@ -3087,12 +3655,16 @@ fn build_outbound_message(
         .to(to)
         .subject(&input.subject)
         .message_id(Some(message_id.to_string()));
-    if let Some(message_id) =
-        reply_context.and_then(|reply| reply_header_id(&reply.provider_message_id))
+    if let Some(message_id) = reply_context
+        .and_then(|reply| nonempty(&reply.message_header_id))
+        .map(ToString::to_string)
     {
+        let references = reply_context
+            .map(reply_references_header)
+            .unwrap_or_default();
         builder = builder
             .in_reply_to(message_id.clone())
-            .references(message_id);
+            .references(references);
     }
     builder.body(input.body.clone()).map_err(|e| e.to_string())
 }
@@ -3157,17 +3729,44 @@ fn reply_context(
     };
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     conn.query_row(
-        "SELECT provider_message_id, thread_id FROM messages WHERE id = ?",
+        "
+        SELECT account_id, thread_id, message_header_id, references_header
+        FROM messages
+        WHERE id = ?
+        ",
         rusqlite::params_from_iter([message_id]),
         |row| {
             Ok(ReplyContext {
-                provider_message_id: row.get(0)?,
+                account_id: row.get(0)?,
                 thread_id: row.get(1)?,
+                message_header_id: row.get(2)?,
+                references_header: row.get(3)?,
             })
         },
     )
     .optional()
     .map_err(|e| e.to_string())
+}
+
+fn reply_references_header(reply_context: &ReplyContext) -> String {
+    let mut refs = Vec::new();
+    refs.extend(parse_message_ids(&reply_context.references_header));
+    if !reply_context.message_header_id.is_empty() {
+        refs.push(reply_context.message_header_id.clone());
+    }
+    dedup_message_ids(refs).join(" ")
+}
+
+fn dedup_message_ids(ids: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for id in ids {
+        let key = id.to_ascii_lowercase();
+        if seen.insert(key) {
+            output.push(id);
+        }
+    }
+    output
 }
 
 fn reply_header_id(provider_message_id: &str) -> Option<String> {
@@ -3200,21 +3799,16 @@ fn delete_message(app: tauri::AppHandle, input: DeleteInput) -> AppResult<()> {
 
 fn run_delete_message(app: &tauri::AppHandle, input: DeleteInput) -> AppResult<()> {
     let state = app.state::<AppState>();
-    let (account, provider_message_id, thread_id, folder) = {
+    let (account, provider_message_id, folder) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let (account_id, provider_message_id, thread_id, folder): (i64, String, String, String) =
-            conn.query_row(
-                "SELECT account_id, provider_message_id, thread_id, folder FROM messages WHERE id = ?",
+        let (account_id, provider_message_id, folder): (i64, String, String) = conn
+            .query_row(
+                "SELECT account_id, provider_message_id, folder FROM messages WHERE id = ?",
                 params![input.message_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(|e| e.to_string())?;
-        (
-            get_account(&conn, account_id)?,
-            provider_message_id,
-            thread_id,
-            folder,
-        )
+        (get_account(&conn, account_id)?, provider_message_id, folder)
     };
 
     let permanent = folder == "Trash";
@@ -3230,7 +3824,7 @@ fn run_delete_message(app: &tauri::AppHandle, input: DeleteInput) -> AppResult<(
         if account.provider == "gmail" {
             delete_gmail_message(&state, &account, &provider_message_id, permanent)?;
         } else {
-            delete_imap_message(&account, &thread_id, permanent)?;
+            delete_imap_message(&account, &provider_message_id, permanent)?;
         }
     }
 
@@ -3289,8 +3883,12 @@ fn delete_gmail_message(
     Ok(())
 }
 
-fn delete_imap_message(account: &StoredAccount, thread_id: &str, permanent: bool) -> AppResult<()> {
-    let (folder, uid) = parse_imap_thread_id(thread_id)?;
+fn delete_imap_message(
+    account: &StoredAccount,
+    provider_message_id: &str,
+    permanent: bool,
+) -> AppResult<()> {
+    let (folder, uid, _) = parse_imap_provider_message_id(provider_message_id)?;
     let mut session = open_imap_session(account)?;
     session.select(&folder).map_err(|e| e.to_string())?;
     if permanent {
@@ -3353,14 +3951,11 @@ fn open_imap_session(
         .map_err(|e| format!("IMAP login failed or timed out after 15s: {}", e.0))
 }
 
-fn parse_imap_thread_id(thread_id: &str) -> AppResult<(String, u32)> {
-    let (folder, uid) = thread_id
-        .rsplit_once(':')
-        .ok_or_else(|| "Cannot identify IMAP message UID".to_string())?;
-    let uid = uid
-        .parse::<u32>()
-        .map_err(|_| "Cannot parse IMAP message UID".to_string())?;
-    Ok((folder.to_string(), uid))
+fn parse_imap_provider_message_id(
+    provider_message_id: &str,
+) -> AppResult<(String, u32, Option<&str>)> {
+    parse_imap_provider_message_id_parts(provider_message_id)
+        .ok_or_else(|| "Cannot identify IMAP message UID".to_string())
 }
 
 #[tauri::command]
@@ -3475,29 +4070,109 @@ fn mark_message_read(app: tauri::AppHandle, input: MarkReadInput) -> AppResult<(
     })
 }
 
-fn run_mark_message_read(app: &tauri::AppHandle, input: MarkReadInput) -> AppResult<()> {
+#[tauri::command]
+fn mark_thread_read(app: tauri::AppHandle, input: MarkReadInput) -> AppResult<()> {
+    start_mail_action_job(app, "Mark thread read state", move |app| {
+        run_mark_thread_read(app, input)
+    })
+}
+
+fn run_mark_thread_read(app: &tauri::AppHandle, input: MarkReadInput) -> AppResult<()> {
     let state = app.state::<AppState>();
-    let (account, provider_message_id, thread_id) = {
+    let folder_scope = match input.folder.as_deref() {
+        Some("Trash") => "AND folder = 'Trash'",
+        Some(_) => "AND folder <> 'Trash'",
+        std::option::Option::None => "",
+    };
+    let (account, thread_id, messages) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let (account_id, provider_message_id, thread_id): (i64, String, String) = conn
+        let (account_id, thread_id): (i64, String) = conn
             .query_row(
-                "SELECT account_id, provider_message_id, thread_id FROM messages WHERE id = ?",
+                "SELECT account_id, thread_id FROM messages WHERE id = ?",
                 params![input.message_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| e.to_string())?;
-        (
-            get_account(&conn, account_id)?,
-            provider_message_id,
-            thread_id,
-        )
+        let sql = format!(
+            "
+            SELECT id, provider_message_id
+            FROM messages
+            WHERE account_id = ? AND thread_id = ?
+            {folder_scope}
+            "
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![account_id, thread_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let messages = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        (get_account(&conn, account_id)?, thread_id, messages)
+    };
+
+    for (_, provider_message_id) in &messages {
+        if is_local_sent_id(provider_message_id) {
+            continue;
+        }
+        if account.provider == "gmail" {
+            mark_gmail_message_read(&state, &account, provider_message_id, input.is_read)?;
+        } else {
+            mark_imap_message_read(&account, provider_message_id, input.is_read)?;
+        }
+    }
+
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let sql = format!(
+        "
+        UPDATE messages
+        SET is_read = ?, updated_at = ?
+        WHERE account_id = ? AND thread_id = ?
+        {folder_scope}
+        "
+    );
+    conn.execute(
+        &sql,
+        params![
+            if input.is_read { 1 } else { 0 },
+            now_ts(),
+            account.id,
+            thread_id
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    debug(
+        app,
+        format!(
+            "Thread read state updated messages={} is_read={}",
+            messages.len(),
+            input.is_read
+        ),
+    );
+    Ok(())
+}
+
+fn run_mark_message_read(app: &tauri::AppHandle, input: MarkReadInput) -> AppResult<()> {
+    let state = app.state::<AppState>();
+    let (account, provider_message_id) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let (account_id, provider_message_id): (i64, String) = conn
+            .query_row(
+                "SELECT account_id, provider_message_id FROM messages WHERE id = ?",
+                params![input.message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        (get_account(&conn, account_id)?, provider_message_id)
     };
 
     if !is_local_sent_id(&provider_message_id) {
         if account.provider == "gmail" {
             mark_gmail_message_read(&state, &account, &provider_message_id, input.is_read)?;
         } else {
-            mark_imap_message_read(&account, &thread_id, input.is_read)?;
+            mark_imap_message_read(&account, &provider_message_id, input.is_read)?;
         }
     }
 
@@ -3531,6 +4206,74 @@ fn remove_account(state: State<'_, AppState>, input: RemoveAccountInput) -> AppR
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn reset_database(app: tauri::AppHandle) -> AppResult<()> {
+    {
+        let state = app.state::<AppState>();
+        let mut syncing = state.syncing.lock().map_err(|e| e.to_string())?;
+        if *syncing {
+            return Err("Cannot reset the database while sync is running".to_string());
+        }
+        *syncing = true;
+    }
+
+    let result = reset_database_inner(&app);
+
+    let state = app.state::<AppState>();
+    if let Ok(mut syncing) = state.syncing.lock() {
+        *syncing = false;
+    }
+
+    result
+}
+
+fn reset_database_inner(app: &tauri::AppHandle) -> AppResult<()> {
+    debug(app, "Resetting local database");
+    let state = app.state::<AppState>();
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let db_path = dir.join("mailwind.sqlite3");
+
+    {
+        let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        let replacement = Connection::open_in_memory().map_err(|e| e.to_string())?;
+        *conn = replacement;
+    }
+
+    for path in sqlite_database_files(&db_path) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Failed to remove {}: {error}", path.display())),
+        }
+    }
+
+    let new_conn = init_db(app).map_err(|e| e.to_string())?;
+    {
+        let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+        *conn = new_conn;
+    }
+    state
+        .idle_accounts
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clear();
+    debug(app, "Local database reset complete");
+    Ok(())
+}
+
+fn sqlite_database_files(db_path: &PathBuf) -> Vec<PathBuf> {
+    ["", "-wal", "-shm"]
+        .iter()
+        .map(|suffix| {
+            let mut path = db_path.as_os_str().to_os_string();
+            path.push(suffix);
+            PathBuf::from(path)
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -3645,10 +4388,10 @@ fn mark_gmail_message_read(
 
 fn mark_imap_message_read(
     account: &StoredAccount,
-    thread_id: &str,
+    provider_message_id: &str,
     is_read: bool,
 ) -> AppResult<()> {
-    let (folder, uid) = parse_imap_thread_id(thread_id)?;
+    let (folder, uid, _) = parse_imap_provider_message_id(provider_message_id)?;
     let mut session = open_imap_session(account)?;
     session.select(&folder).map_err(|e| e.to_string())?;
     let command = if is_read {
@@ -3689,9 +4432,12 @@ pub fn run() {
             list_accounts,
             list_folders,
             list_messages,
+            list_thread_messages,
             mark_message_read,
+            mark_thread_read,
             mailbox_snapshot,
             remove_account,
+            reset_database,
             send_message,
             sync_account,
             sync_all,

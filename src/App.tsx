@@ -61,6 +61,10 @@ type MailMessage = {
   account_id: number;
   provider_message_id: string;
   thread_id: string;
+  message_header_id: string;
+  in_reply_to: string;
+  references_header: string;
+  normalized_subject: string;
   folder: string;
   subject: string;
   from_addr: string;
@@ -73,6 +77,8 @@ type MailMessage = {
   is_read: boolean;
   account_email: string;
   account_provider: string;
+  thread_count: number;
+  thread_unread_count: number;
   attachments: Attachment[];
 };
 
@@ -100,6 +106,14 @@ type MailboxChanged = {
 type ReadFilter = "all" | "read" | "unread";
 type AppView = "mail" | "settings";
 
+type ComposerState = {
+  account_id: string;
+  to: string;
+  subject: string;
+  body: string;
+  reply_to_message_id: number | null;
+};
+
 type ImapSettingsForm = {
   email: string;
   display_name: string;
@@ -118,6 +132,14 @@ const emptySnapshot: Snapshot = {
   page: 0,
   page_size: 50,
   total: 0,
+};
+
+const emptyComposer: ComposerState = {
+  account_id: "",
+  to: "",
+  subject: "",
+  body: "",
+  reply_to_message_id: null,
 };
 
 const themeOptions = [
@@ -180,7 +202,8 @@ function App() {
   const [showComposer, setShowComposer] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [debugLines, setDebugLines] = useState<string[]>([]);
-  const [composer, setComposer] = useState({ account_id: "", to: "", subject: "", body: "" });
+  const [composer, setComposer] = useState<ComposerState>(emptyComposer);
+  const [threadMessages, setThreadMessages] = useState<MailMessage[]>([]);
   const [notificationsEnabled, setNotificationsEnabled] = useState(
     () => window.localStorage.getItem("mailwind-notifications") === "enabled",
   );
@@ -188,10 +211,10 @@ function App() {
   const [accountEditForm, setAccountEditForm] = useState<ImapSettingsForm | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const messageRowRefs = useRef<Record<number, HTMLButtonElement | null>>({});
-  const emailFrameRef = useRef<HTMLIFrameElement | null>(null);
   const openEmailLinkRef = useRef<(rawUrl: string) => void>(() => undefined);
   const leftAltDownRef = useRef(false);
   const composerBodyRef = useRef<HTMLTextAreaElement | null>(null);
+  const threadRequestRef = useRef(0);
   const [gmailForm, setGmailForm] = useState({ client_id: "", client_secret: "" });
   const [imapForm, setImapForm] = useState({
     email: "",
@@ -290,7 +313,6 @@ function App() {
 
   useEffect(() => {
     const onEmailLinkMessage = (event: MessageEvent) => {
-      if (event.source !== emailFrameRef.current?.contentWindow) return;
       const href = emailLinkMessageHref(event.data);
       if (!href) return;
       openEmailLinkRef.current(href);
@@ -363,8 +385,29 @@ function App() {
     const freshSelected = data.messages.find((message) => message.id === selectedId);
     if (freshSelected) {
       setSelectedMessage(freshSelected);
+      void loadThreadMessages(freshSelected.id);
     } else if (selectedId && !selectedMessage) {
       setSelectedId(null);
+      setThreadMessages([]);
+    }
+  }
+
+  async function loadThreadMessages(messageId: number) {
+    const requestId = threadRequestRef.current + 1;
+    threadRequestRef.current = requestId;
+    try {
+      const messages = await invoke<MailMessage[]>("list_thread_messages", {
+        input: { message_id: messageId, folder },
+      });
+      if (threadRequestRef.current === requestId) {
+        setThreadMessages(messages);
+      }
+    } catch (error) {
+      if (threadRequestRef.current !== requestId) return;
+      setThreadMessages([]);
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(message);
+      pushDebug(`Error: ${message}`);
     }
   }
 
@@ -440,10 +483,12 @@ function App() {
   async function selectMessage(message: MailMessage) {
     setSelectedId(message.id);
     setSelectedMessage(message);
+    setThreadMessages([]);
+    await loadThreadMessages(message.id);
     setShowComposer(false);
     setView("mail");
-    if (!message.is_read) {
-      await markRead(message, true, false);
+    if (isThreadUnread(message)) {
+      await markThreadRead(message, true, false);
     }
   }
 
@@ -471,8 +516,21 @@ function App() {
 
   function openSettings() {
     setView("settings");
+    clearCurrentMessage();
+  }
+
+  function clearCurrentMessage() {
+    threadRequestRef.current += 1;
     setSelectedId(null);
     setSelectedMessage(null);
+    setThreadMessages([]);
+  }
+
+  function changeReadFilter(nextFilter: ReadFilter) {
+    setReadFilter(nextFilter);
+    clearCurrentMessage();
+    setPage(0);
+    setView("mail");
   }
 
   function handleMessageListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
@@ -491,8 +549,7 @@ function App() {
 
     if (event.key === "ArrowLeft") {
       if (page > 0) {
-        setSelectedId(null);
-        setSelectedMessage(null);
+        clearCurrentMessage();
         setPage((value) => Math.max(0, value - 1));
         window.setTimeout(() => messageListRef.current?.focus(), 0);
       }
@@ -501,8 +558,7 @@ function App() {
 
     if (event.key === "ArrowRight") {
       if (page + 1 < pageCount) {
-        setSelectedId(null);
-        setSelectedMessage(null);
+        clearCurrentMessage();
         setPage((value) => Math.min(pageCount - 1, value + 1));
         window.setTimeout(() => messageListRef.current?.focus(), 0);
       }
@@ -523,19 +579,28 @@ function App() {
     }
   }
 
-  async function markRead(message: MailMessage, isRead: boolean, reloadAfter = true) {
+  async function markThreadRead(message: MailMessage, isRead: boolean, reloadAfter = true) {
     setSnapshot((current) => ({
       ...current,
       messages: current.messages.map((item) =>
-        item.id === message.id ? { ...item, is_read: isRead } : item,
+        item.account_id === message.account_id && item.thread_id === message.thread_id
+          ? withThreadReadState(item, isRead)
+          : item,
       ),
     }));
-    if (selectedMessage?.id === message.id) {
-      setSelectedMessage({ ...selectedMessage, is_read: isRead });
+    if (selectedMessage?.account_id === message.account_id && selectedMessage.thread_id === message.thread_id) {
+      setSelectedMessage(withThreadReadState(selectedMessage, isRead));
     }
+    setThreadMessages((items) =>
+      items.map((item) =>
+        item.account_id === message.account_id && item.thread_id === message.thread_id
+          ? withThreadReadState(item, isRead)
+          : item,
+      ),
+    );
     try {
-      await invoke<void>("mark_message_read", {
-        input: { message_id: message.id, is_read: isRead },
+      await invoke<void>("mark_thread_read", {
+        input: { message_id: message.id, is_read: isRead, folder },
       });
       if (reloadAfter) await load();
     } catch (error) {
@@ -562,10 +627,13 @@ function App() {
           to: composer.to,
           subject: composer.subject,
           body: composer.body,
-          reply_to_message_id: selected?.id ?? null,
+          reply_to_message_id: composer.reply_to_message_id,
         },
       });
-      setComposer({ account_id: "", to: "", subject: "", body: "" });
+      setComposer(emptyComposer);
+      setSelectedId(null);
+      setSelectedMessage(null);
+      setThreadMessages([]);
       setFolder("Sent");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -577,26 +645,30 @@ function App() {
   function openCompose() {
     setSelectedId(null);
     setSelectedMessage(null);
+    setThreadMessages([]);
     setComposer({
       account_id: String(accountId ?? snapshot.accounts[0]?.id ?? ""),
       to: "",
       subject: "",
       body: "",
+      reply_to_message_id: null,
     });
     setShowComposer(true);
     setView("mail");
   }
 
   function openReply() {
-    if (!selected) {
+    const replyTarget = latestThreadMessage(threadMessages, selected);
+    if (!replyTarget) {
       openCompose();
       return;
     }
     setComposer({
-      account_id: String(selected.account_id),
-      to: replyAddress(selected),
-      subject: replySubject(selected.subject),
+      account_id: String(replyTarget.account_id),
+      to: replyAddress(replyTarget),
+      subject: replySubject(replyTarget.subject),
       body: "",
+      reply_to_message_id: replyTarget.id,
     });
     setShowComposer(true);
     window.setTimeout(() => composerBodyRef.current?.focus(), 0);
@@ -676,6 +748,7 @@ function App() {
       await invoke<void>("delete_message", { input: { message_id: selected.id } });
       setSelectedId(null);
       setSelectedMessage(null);
+      setThreadMessages([]);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(message);
@@ -707,16 +780,14 @@ function App() {
 
   function selectFolder(nextFolder: string) {
     setFolder(nextFolder);
-    setSelectedId(null);
-    setSelectedMessage(null);
+    clearCurrentMessage();
     setView("mail");
     setPage(0);
   }
 
   function selectAccount(nextAccountId: number | null) {
     setAccountId(nextAccountId);
-    setSelectedId(null);
-    setSelectedMessage(null);
+    clearCurrentMessage();
     setView("mail");
     setPage(0);
   }
@@ -727,9 +798,47 @@ function App() {
     await run("Removing account", async () => {
       await invoke<void>("remove_account", { input: { account_id: account.id } });
       if (accountId === account.id) setAccountId(null);
-      setSelectedId(null);
-      setSelectedMessage(null);
+      clearCurrentMessage();
     });
+  }
+
+  async function resetLocalDatabase() {
+    const ok = window.confirm(
+      "Delete and recreate the complete local Mailwind database? This removes connected accounts, synced mail, attachments, settings, and local credentials from this app.",
+    );
+    if (!ok) return;
+
+    setStatus("Resetting local database");
+    pushDebug("Resetting local database");
+    try {
+      await invoke<void>("reset_database");
+      const data = await invoke<Snapshot>("mailbox_snapshot", {
+        filter: {
+          folder: "Inbox",
+          account_id: null,
+          query: null,
+          read_filter: "all",
+          page: 0,
+          page_size: pageSize,
+        },
+      });
+      setFolder("Inbox");
+      setAccountId(null);
+      setQuery("");
+      setReadFilter("all");
+      setPage(0);
+      clearCurrentMessage();
+      setSnapshot(data);
+      setComposer(emptyComposer);
+      setEditingAccountId(null);
+      setAccountEditForm(null);
+      setStatus("Database reset");
+      pushDebug("Database reset");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(message);
+      pushDebug(`Error: ${message}`);
+    }
   }
 
   function editAccount(account: Account) {
@@ -771,7 +880,12 @@ function App() {
   const inboxFolder = snapshot.folders.find((item) => item.name === "Inbox");
   const pageStart = snapshot.total === 0 ? 0 : page * pageSize + 1;
   const pageEnd = Math.min(snapshot.total, (page + 1) * pageSize);
-  const selectedIsHtml = selected ? isHtmlMessage(selected) : false;
+  const displayedThread = selected
+    ? threadMessages.length
+      ? threadMessages
+      : [selected]
+    : [];
+  const selectedThreadUnread = selected ? isThreadUnread(selected) : false;
   const shellStyle = {
     "--accent": accentColor,
     "--accent-rgb": hexToRgb(accentColor),
@@ -815,8 +929,8 @@ function App() {
           <button className="command" disabled={!selected} onClick={deleteSelected} title={selected?.folder === "Trash" ? "Delete forever" : "Delete"} aria-label={selected?.folder === "Trash" ? "Delete forever" : "Delete email"}>
             <Trash2 size={18} /> <span className="command-label">Delete</span> <span className="shortcut">D</span>
           </button>
-          <button className="command" disabled={!selected} onClick={() => selected && void markRead(selected, !selected.is_read)} title={selected?.is_read ? "Mark unread" : "Mark read"} aria-label={selected?.is_read ? "Mark unread" : "Mark read"}>
-            {selected?.is_read ? <EyeOff size={18} /> : <CheckCircle2 size={18} />} <span className="command-label">{selected?.is_read ? "Unread" : "Read"}</span> <span className="shortcut">R</span>
+          <button className="command" disabled={!selected} onClick={() => selected && void markThreadRead(selected, selectedThreadUnread)} title={selectedThreadUnread ? "Mark read" : "Mark unread"} aria-label={selectedThreadUnread ? "Mark thread read" : "Mark thread unread"}>
+            {selectedThreadUnread ? <CheckCircle2 size={18} /> : <EyeOff size={18} />} <span className="command-label">{selectedThreadUnread ? "Read" : "Unread"}</span> <span className="shortcut">R</span>
           </button>
           <button className="icon-command" onClick={() => setShowDebug((value) => !value)} title="Debug log" aria-label="Toggle debug log">
             <Bug size={18} />
@@ -1022,6 +1136,17 @@ function App() {
             ) : null}
           </section>
 
+          <section className="settings-section danger-section">
+            <h3>Local database</h3>
+            <p>
+              Delete all local accounts, synced messages, attachments, credentials, and settings,
+              then recreate a fresh empty database.
+            </p>
+            <button className="danger-button" onClick={() => void resetLocalDatabase()} type="button">
+              Delete and recreate database
+            </button>
+          </section>
+
           <section className="settings-section">
             <details open>
               <summary>Add Gmail / Google Workspace</summary>
@@ -1107,7 +1232,11 @@ function App() {
           <button onClick={() => void load()} title="Refresh current view">
             <RefreshCw size={16} />
           </button>
-          <button onClick={() => setReadFilter(readFilter === "unread" ? "all" : "unread")} title="Unread filter">
+          <button
+            className={readFilter === "unread" ? "active" : undefined}
+            onClick={() => changeReadFilter(readFilter === "unread" ? "all" : "unread")}
+            title="Unread filter"
+          >
             <SlidersHorizontal size={16} />
           </button>
         </div>
@@ -1117,12 +1246,7 @@ function App() {
             <button
               className={readFilter === filter ? "filter active" : "filter"}
               key={filter}
-              onClick={() => {
-                setReadFilter(filter);
-                setSelectedId(null);
-                setSelectedMessage(null);
-                setPage(0);
-              }}
+              onClick={() => changeReadFilter(filter)}
             >
               {filter === "all" ? "All" : filter[0].toUpperCase() + filter.slice(1)}
             </button>
@@ -1143,7 +1267,7 @@ function App() {
               aria-selected={message.id === selected?.id}
               className={[
                 "message-row",
-                message.is_read ? "read" : "unread",
+                isThreadUnread(message) ? "unread" : "read",
                 message.id === selected?.id ? "selected" : "",
               ].join(" ")}
               id={`message-row-${message.id}`}
@@ -1159,16 +1283,18 @@ function App() {
               <div className="message-row-content">
                 <div className="row-top">
                   <span className="sender-wrap">
-                    {!message.is_read ? <i aria-hidden="true" className="unread-dot" /> : null}
+                    {isThreadUnread(message) ? <i aria-hidden="true" className="unread-dot" /> : null}
                     <span className="sender-text">{shortName(message.from_addr || message.to_addr || message.account_email)}</span>
                   </span>
+                  {message.thread_count > 1 ? <small className="thread-count">{message.thread_count}</small> : null}
                   {messageCategory(message) ? <small className="message-tag">{messageCategory(message)}</small> : null}
                 </div>
-                <strong className={message.is_read ? undefined : "unread-subject"}>{message.subject}</strong>
+                <strong className={isThreadUnread(message) ? "unread-subject" : undefined}>{message.subject}</strong>
                 <p>{message.snippet || "(no preview)"}</p>
                 <div className="row-meta">
                   <small className="row-meta-email">{message.account_email}</small>
                   <div className="row-meta-right">
+                    {message.thread_unread_count > 0 ? <small className="thread-unread-count">{message.thread_unread_count} unread</small> : null}
                     {message.attachments.length ? <small className="attachment-count"><Paperclip size={13} /> {message.attachments.length}</small> : null}
                     <time>{formatMessageTime(message.date_ts)}</time>
                   </div>
@@ -1217,10 +1343,11 @@ function App() {
                 <div className="reader-title-row">
                   <h2>{selected.subject}</h2>
                   <span>{selected.folder}</span>
+                  {selected.thread_count > 1 ? <em>{selected.thread_count} messages</em> : null}
                 </div>
                 <div className="reader-actions">
-                  <button onClick={() => selected && void markRead(selected, !selected.is_read)} title={selected.is_read ? "Mark unread" : "Mark read"}>
-                    {selected.is_read ? <EyeOff size={18} /> : <CheckCircle2 size={18} />}
+                  <button onClick={() => selected && void markThreadRead(selected, selectedThreadUnread)} title={selectedThreadUnread ? "Mark read" : "Mark unread"}>
+                    {selectedThreadUnread ? <CheckCircle2 size={18} /> : <EyeOff size={18} />}
                   </button>
                   <button disabled={!selected} onClick={deleteSelected} title={selected.folder === "Trash" ? "Delete forever" : "Delete"}>
                     <Trash2 size={18} />
@@ -1230,48 +1357,64 @@ function App() {
                   </button>
                 </div>
               </div>
-              <div className="reader-contact-row">
-                <div className="reader-contact-left">
-                  <span className="avatar large" style={{ backgroundColor: colorForInitials(initialsFor(selected.from_addr || selected.account_email)), color: "#fff" }}>{initialsFor(selected.from_addr || selected.account_email)}</span>
-                  <div className="reader-contact-info">
-                    <p className="reader-contact-primary">
-                      <strong>{shortName(selected.from_addr || selected.account_email)}</strong>
-                      {" "}
-                      <span>&lt;{extractEmailAddress(selected.from_addr) || selected.account_email}&gt;</span>
-                    </p>
-                    <p className="reader-contact-secondary">
-                      to {selected.to_addr || selected.account_email}
-                    </p>
-                  </div>
-                </div>
-                <div className="reader-contact-right">
-                  <time className="reader-time-primary">{new Date(selected.date_ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
-                  <time className="reader-time-secondary">{new Date(selected.date_ts * 1000).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}</time>
-                </div>
-              </div>
             </div>
-            {selected.attachments.length ? (
-              <div className="attachments">
-                {selected.attachments.map((attachment) => (
-                  <button key={attachment.id} onClick={() => downloadAttachment(attachment)}>
-                    <Download size={16} />
-                    <strong>{attachment.filename}</strong>
-                    <span>{formatBytes(attachment.size)}</span>
-                  </button>
-                ))}
-              </div>
-            ) : null}
-            {selectedIsHtml ? (
-              <iframe
-                ref={emailFrameRef}
-                className="html-body"
-                sandbox="allow-scripts"
-                title="Email HTML body"
-                srcDoc={sanitizeHtml(selected.body)}
-              />
-            ) : (
-              <pre>{selected.body || selected.snippet}</pre>
-            )}
+            <div className="thread-stack">
+              {displayedThread.map((message, index) => (
+                <details
+                  className={[
+                    "thread-message",
+                    message.is_read ? "read" : "unread",
+                    index === displayedThread.length - 1 ? "latest" : "",
+                  ].join(" ")}
+                  key={message.id}
+                  open={index === displayedThread.length - 1 || displayedThread.length <= 2}
+                >
+                  <summary className="thread-message-head">
+                    <div className="reader-contact-left">
+                      <span className="avatar large" style={{ backgroundColor: colorForInitials(initialsFor(message.from_addr || message.account_email)), color: "#fff" }}>{initialsFor(message.from_addr || message.account_email)}</span>
+                      <div className="reader-contact-info">
+                        <p className="reader-contact-primary">
+                          <strong>{shortName(message.from_addr || message.account_email)}</strong>
+                          {" "}
+                          <span>&lt;{extractEmailAddress(message.from_addr) || message.account_email}&gt;</span>
+                        </p>
+                        <p className="reader-contact-secondary">
+                          to {message.to_addr || message.account_email}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="thread-message-meta">
+                      <time>{formatFullDate(message.date_ts)}</time>
+                      {message.folder !== selected.folder ? <span>{message.folder}</span> : null}
+                    </div>
+                  </summary>
+                  <div className="thread-message-body">
+                    {message.attachments.length ? (
+                      <div className="attachments thread-attachments">
+                        {message.attachments.map((attachment) => (
+                          <button key={attachment.id} onClick={() => downloadAttachment(attachment)}>
+                            <Download size={16} />
+                            <strong>{attachment.filename}</strong>
+                            <span>{formatBytes(attachment.size)}</span>
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                    {isHtmlMessage(message) ? (
+                      <iframe
+                        className="html-body thread-html-body"
+                        sandbox="allow-scripts"
+                        title={`Email HTML body from ${shortName(message.from_addr || message.account_email)}`}
+                        srcDoc={sanitizeHtml(message.body)}
+                        onLoad={(event) => resizeEmailFrame(event.currentTarget)}
+                      />
+                    ) : (
+                      <pre>{message.body || message.snippet}</pre>
+                    )}
+                  </div>
+                </details>
+              ))}
+            </div>
           </article>
         ) : (
           <article className="reader empty-reader">
@@ -1353,6 +1496,55 @@ function formatMessageTime(timestamp: number) {
     return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function formatFullDate(timestamp: number) {
+  return new Date(timestamp * 1000).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function isThreadUnread(message: MailMessage) {
+  return message.thread_unread_count > 0 || !message.is_read;
+}
+
+function withThreadReadState(message: MailMessage, isRead: boolean): MailMessage {
+  return {
+    ...message,
+    is_read: isRead,
+    thread_unread_count: isRead ? 0 : Math.max(1, message.thread_count || 1),
+  };
+}
+
+function latestThreadMessage(messages: MailMessage[], fallback: MailMessage | null) {
+  if (!messages.length) return fallback;
+  return messages.reduce((latest, message) =>
+    message.date_ts >= latest.date_ts ? message : latest,
+  );
+}
+
+function resizeEmailFrame(frame: HTMLIFrameElement) {
+  const applyHeight = () => {
+    try {
+      const doc = frame.contentDocument;
+      const height = Math.max(
+        doc?.documentElement.scrollHeight ?? 0,
+        doc?.body.scrollHeight ?? 0,
+      );
+      if (height > 0) {
+        frame.style.height = `${Math.min(Math.max(height + 2, 180), 6000)}px`;
+      }
+    } catch {
+      frame.style.height = "560px";
+    }
+  };
+  applyHeight();
+  window.setTimeout(applyHeight, 100);
+  window.setTimeout(applyHeight, 600);
 }
 
 function formatBytes(size: number) {
@@ -1457,7 +1649,7 @@ function sanitizeHtml(value: string) {
     }
   });
   const linkBridgeScript = `<script>(()=>{document.addEventListener("click",(event)=>{const target=event.target;if(!(target instanceof Element))return;const anchor=target.closest("a[href]");if(!anchor)return;event.preventDefault();window.parent.postMessage({type:"mailwind-open-email-link",href:anchor.getAttribute("href")||anchor.href||""},"*");},true);})();<\/script>`;
-  return `<!doctype html><html><head><base target="_blank"><style>html{background:#fff}body{box-sizing:border-box;margin:0;padding:34px 44px;color:#1f2937;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}img{max-width:100%;height:auto}table{max-width:100%}@media(max-width:700px){body{padding:22px}}</style>${linkBridgeScript}</head><body>${doc.body.innerHTML}</body></html>`;
+  return `<!doctype html><html><head><base target="_blank"><style>html{background:#fff;overflow:hidden}body{box-sizing:border-box;max-width:100%;margin:0;padding:18px 34px 30px;color:#1f2937;font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere;word-break:normal}img,video{max-width:100%;height:auto}table{max-width:100%;border-collapse:collapse}td,th{max-width:100%;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{overflow-wrap:anywhere}blockquote{margin-left:0;padding-left:14px;border-left:3px solid #e5e7eb;color:#4b5563}@media(max-width:700px){body{padding:16px 18px 24px}}</style>${linkBridgeScript}</head><body>${doc.body.innerHTML}</body></html>`;
 }
 
 function safeExternalUrl(value: string) {
