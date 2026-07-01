@@ -593,40 +593,31 @@ function App() {
           <input
             value={query}
             onChange={(event) => setQuery(event.currentTarget.value)}
-            placeholder="Search mail, people, files and commands..."
+            placeholder="Search mail, people, files and commands…"
+            aria-label="Search mail"
           />
           <button type="submit">Search</button>
         </form>
         <div className="top-actions">
-          <button className="command primary-command" onClick={openCompose}>
-            <PenLine size={18} /> Compose
+          <button className="command primary-command" onClick={openCompose} aria-label="Compose email">
+            <PenLine size={18} /> <span className="command-label">Compose</span> <span className="shortcut">C</span>
           </button>
-          <button className="icon-command" disabled={syncing} onClick={syncAll} title={syncing ? "Syncing" : "Sync"}>
-            <RefreshCw size={18} />
+          <button className="command" disabled={syncing} onClick={syncAll} title={syncing ? "Syncing" : "Sync"} aria-label="Sync mail">
+            <RefreshCw size={18} /> <span className="command-label">Sync</span> <span className="shortcut">S</span>
           </button>
-          <button className="icon-command" disabled={!selected} onClick={deleteSelected} title={selected?.folder === "Trash" ? "Delete forever" : "Delete"}>
-            <Trash2 size={18} />
+          <button className="command" disabled={!selected} onClick={deleteSelected} title={selected?.folder === "Trash" ? "Delete forever" : "Delete"} aria-label={selected?.folder === "Trash" ? "Delete forever" : "Delete email"}>
+            <Trash2 size={18} /> <span className="command-label">Delete</span> <span className="shortcut">D</span>
           </button>
-          <button className="icon-command" disabled={!selected} onClick={() => selected && void markRead(selected, !selected.is_read)} title={selected?.is_read ? "Mark unread" : "Mark read"}>
-            {selected?.is_read ? <EyeOff size={18} /> : <CheckCircle2 size={18} />}
+          <button className="command" disabled={!selected} onClick={() => selected && void markRead(selected, !selected.is_read)} title={selected?.is_read ? "Mark unread" : "Mark read"} aria-label={selected?.is_read ? "Mark unread" : "Mark read"}>
+            {selected?.is_read ? <EyeOff size={18} /> : <CheckCircle2 size={18} />} <span className="command-label">{selected?.is_read ? "Unread" : "Read"}</span> <span className="shortcut">R</span>
           </button>
-          <button className="icon-command" onClick={() => setShowDebug((value) => !value)} title="Debug log">
+          <button className="icon-command" onClick={() => setShowDebug((value) => !value)} title="Debug log" aria-label="Toggle debug log">
             <Bug size={18} />
           </button>
-          <span className="topbar-separator" aria-hidden="true" />
-          <div className="profile-badge">{currentAccount?.email?.slice(0, 2).toUpperCase() ?? "MW"}</div>
         </div>
       </header>
 
       <aside className="sidebar">
-        <div className="sidebar-account">
-          <div className="profile-badge large">{currentAccount?.email?.slice(0, 2).toUpperCase() ?? "MW"}</div>
-          <div>
-            <strong>{currentAccount?.display_name || currentAccount?.email?.split("@")[0] || "Mailwind"}</strong>
-            <p>{currentAccount?.email || "Unified inbox"}</p>
-          </div>
-        </div>
-
         <section className="sidebar-group">
           <div className="section-title">Folders</div>
           {snapshot.folders.map((item) => (
@@ -671,7 +662,7 @@ function App() {
         <div className="sidebar-bottom">
           <button className="sync-button" disabled={syncing} onClick={syncAll}>
             <RefreshCw size={17} />
-            {syncing ? "Syncing..." : "Sync all"}
+            {syncing ? "Syncing…" : "Sync all"}
           </button>
           <button
             className={view === "settings" ? "settings-button active" : "settings-button"}
@@ -943,20 +934,24 @@ function App() {
               key={message.id}
               onClick={() => void selectMessage(message)}
             >
-              <div className="row-top">
-                <span className="sender-wrap">
-                  <span className="avatar">{initialsFor(message.from_addr || message.account_email)}</span>
-                  {!message.is_read ? <i aria-hidden="true" className="unread-dot" /> : null}
-                  <span className="sender-text">{shortName(message.from_addr || message.to_addr || message.account_email)}</span>
-                </span>
-                <time>{formatMessageTime(message.date_ts)}</time>
-              </div>
-              <strong className={message.is_read ? undefined : "unread-subject"}>{message.subject}</strong>
-              <p>{plainPreview(message.snippet || message.body)}</p>
-              <div className="row-meta">
-                <small>{message.account_email}</small>
-                {messageCategory(message) ? <small className="message-tag">{messageCategory(message)}</small> : null}
-                {message.attachments.length ? <small className="attachment-count"><Paperclip size={13} /> {message.attachments.length}</small> : null}
+              <span className="avatar" style={{ backgroundColor: colorForInitials(initialsFor(message.from_addr || message.account_email)), color: "#fff" }}>{initialsFor(message.from_addr || message.account_email)}</span>
+              <div className="message-row-content">
+                <div className="row-top">
+                  <span className="sender-wrap">
+                    {!message.is_read ? <i aria-hidden="true" className="unread-dot" /> : null}
+                    <span className="sender-text">{shortName(message.from_addr || message.to_addr || message.account_email)}</span>
+                  </span>
+                  {messageCategory(message) ? <small className="message-tag">{messageCategory(message)}</small> : null}
+                </div>
+                <strong className={message.is_read ? undefined : "unread-subject"}>{message.subject}</strong>
+                <p>{plainPreview(message.snippet || message.body)}</p>
+                <div className="row-meta">
+                  <small className="row-meta-email">{message.account_email}</small>
+                  <div className="row-meta-right">
+                    {message.attachments.length ? <small className="attachment-count"><Paperclip size={13} /> {message.attachments.length}</small> : null}
+                    <time>{formatMessageTime(message.date_ts)}</time>
+                  </div>
+                </div>
               </div>
             </button>
           ))}
@@ -997,37 +992,41 @@ function App() {
         {selected ? (
           <article className="reader">
             <div className="reader-head">
-              <div>
+              <div className="reader-head-top">
                 <div className="reader-title-row">
                   <h2>{selected.subject}</h2>
                   <span>{selected.folder}</span>
                 </div>
-                <div className="reader-contact-row">
-                  <span className="avatar large">{initialsFor(selected.from_addr || selected.account_email)}</span>
-                  <div>
-                    <p>
+                <div className="reader-actions">
+                  <button onClick={() => selected && void markRead(selected, !selected.is_read)} title={selected.is_read ? "Mark unread" : "Mark read"}>
+                    {selected.is_read ? <EyeOff size={18} /> : <CheckCircle2 size={18} />}
+                  </button>
+                  <button disabled={!selected} onClick={deleteSelected} title={selected.folder === "Trash" ? "Delete forever" : "Delete"}>
+                    <Trash2 size={18} />
+                  </button>
+                  <button className="reply-action" onClick={openReply} title="Reply">
+                    <PenLine size={18} />
+                  </button>
+                </div>
+              </div>
+              <div className="reader-contact-row">
+                <div className="reader-contact-left">
+                  <span className="avatar large" style={{ backgroundColor: colorForInitials(initialsFor(selected.from_addr || selected.account_email)), color: "#fff" }}>{initialsFor(selected.from_addr || selected.account_email)}</span>
+                  <div className="reader-contact-info">
+                    <p className="reader-contact-primary">
                       <strong>{shortName(selected.from_addr || selected.account_email)}</strong>
                       {" "}
-                      <span>{selected.from_addr}</span>
+                      <span>&lt;{extractEmailAddress(selected.from_addr) || selected.account_email}&gt;</span>
                     </p>
-                    <p className="reader-subline">
+                    <p className="reader-contact-secondary">
                       to {selected.to_addr || selected.account_email}
                     </p>
                   </div>
                 </div>
-              </div>
-              <div className="reader-actions">
-                <button className="reply-action" onClick={openReply} title="Reply">
-                  <PenLine size={18} />
-                  <span>Reply</span>
-                </button>
-                <button onClick={() => selected && void markRead(selected, !selected.is_read)} title={selected.is_read ? "Mark unread" : "Mark read"}>
-                  {selected.is_read ? <EyeOff size={18} /> : <CheckCircle2 size={18} />}
-                </button>
-                <button disabled={!selected} onClick={deleteSelected} title={selected.folder === "Trash" ? "Delete forever" : "Delete"}>
-                  <Trash2 size={18} />
-                </button>
-                <time>{new Date(selected.date_ts * 1000).toLocaleString()}</time>
+                <div className="reader-contact-right">
+                  <time className="reader-time-primary">{new Date(selected.date_ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>
+                  <time className="reader-time-secondary">{new Date(selected.date_ts * 1000).toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' })}</time>
+                </div>
               </div>
             </div>
             {selected.attachments.length ? (
@@ -1199,6 +1198,26 @@ function initialsFor(value: string) {
     ? `${parts[0][0]}${parts[1][0]}`
     : name.slice(0, 2);
   return initials.toUpperCase();
+}
+
+function colorForInitials(initials: string) {
+  const colors = [
+    "#3b82f6", // blue
+    "#ef4444", // red
+    "#10b981", // green
+    "#f59e0b", // yellow/amber
+    "#8b5cf6", // violet
+    "#ec4899", // pink
+    "#06b6d4", // cyan
+    "#f97316", // orange
+    "#6366f1", // indigo
+    "#14b8a6", // teal
+  ];
+  let hash = 0;
+  for (let i = 0; i < initials.length; i++) {
+    hash = initials.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  return colors[Math.abs(hash) % colors.length];
 }
 
 function sanitizeHtml(value: string) {
