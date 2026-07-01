@@ -415,6 +415,7 @@ fn get_account(conn: &Connection, id: i64) -> AppResult<StoredAccount> {
 }
 
 fn upsert_message(conn: &Connection, account_id: i64, msg: &NewMessage) -> AppResult<()> {
+    delete_matching_local_sent_copy(conn, account_id, msg)?;
     let ts = now_ts();
     conn.execute(
         "
@@ -497,12 +498,51 @@ fn upsert_message(conn: &Connection, account_id: i64, msg: &NewMessage) -> AppRe
     Ok(())
 }
 
+fn delete_matching_local_sent_copy(
+    conn: &Connection,
+    account_id: i64,
+    msg: &NewMessage,
+) -> AppResult<()> {
+    if msg.folder != "Sent" || is_local_sent_id(&msg.provider_message_id) {
+        return Ok(());
+    }
+    let Some(message_id) = reply_header_id(&msg.provider_message_id) else {
+        return Ok(());
+    };
+    let local_id = format!("local-sent:{message_id}");
+    let mut stmt = conn
+        .prepare(
+            "
+            SELECT id
+            FROM messages
+            WHERE account_id = ? AND folder = 'Sent' AND provider_message_id = ?
+            ",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![account_id, local_id], |row| row.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?;
+    let ids = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt);
+
+    for id in ids {
+        delete_message_row(conn, id)?;
+    }
+    Ok(())
+}
+
 fn delete_message_row(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute("DELETE FROM messages_fts WHERE rowid = ?", params![id])
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM messages WHERE id = ?", params![id])
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn is_local_sent_id(provider_message_id: &str) -> bool {
+    provider_message_id.starts_with("local-sent-") || provider_message_id.starts_with("local-sent:")
 }
 
 fn delete_messages_by_thread(
@@ -538,7 +578,9 @@ fn existing_provider_ids(
             "
             SELECT provider_message_id
             FROM messages
-            WHERE account_id = ? AND folder = ? AND provider_message_id NOT LIKE 'local-sent-%'
+            WHERE account_id = ? AND folder = ?
+              AND provider_message_id NOT LIKE 'local-sent-%'
+              AND provider_message_id NOT LIKE 'local-sent:%'
             ",
         )
         .map_err(|e| e.to_string())?;
@@ -559,7 +601,9 @@ fn existing_thread_ids(
             "
             SELECT thread_id
             FROM messages
-            WHERE account_id = ? AND folder = ? AND provider_message_id NOT LIKE 'local-sent-%'
+            WHERE account_id = ? AND folder = ?
+              AND provider_message_id NOT LIKE 'local-sent-%'
+              AND provider_message_id NOT LIKE 'local-sent:%'
             ",
         )
         .map_err(|e| e.to_string())?;
@@ -581,7 +625,9 @@ fn delete_missing_provider_ids(
             "
             SELECT id, provider_message_id
             FROM messages
-            WHERE account_id = ? AND folder = ? AND provider_message_id NOT LIKE 'local-sent-%'
+            WHERE account_id = ? AND folder = ?
+              AND provider_message_id NOT LIKE 'local-sent-%'
+              AND provider_message_id NOT LIKE 'local-sent:%'
             ",
         )
         .map_err(|e| e.to_string())?;
@@ -616,7 +662,9 @@ fn delete_missing_thread_ids(
             "
             SELECT id, thread_id
             FROM messages
-            WHERE account_id = ? AND folder = ? AND provider_message_id NOT LIKE 'local-sent-%'
+            WHERE account_id = ? AND folder = ?
+              AND provider_message_id NOT LIKE 'local-sent-%'
+              AND provider_message_id NOT LIKE 'local-sent:%'
             ",
         )
         .map_err(|e| e.to_string())?;
@@ -2635,15 +2683,34 @@ fn run_send_message(app: &tauri::AppHandle, input: SendInput) -> AppResult<Store
         get_account(&conn, input.account_id)?
     };
     let reply_context = reply_context(&state, input.reply_to_message_id)?;
+    let sent_message_id = outbound_message_id(&account.email);
+    let outbound =
+        build_outbound_message(&account, &input, reply_context.as_ref(), &sent_message_id)?;
 
     if account.provider == "gmail" {
-        send_gmail(&state, &account, &input, reply_context.as_ref())?;
+        send_gmail(&state, &account, &outbound, reply_context.as_ref())?;
     } else {
-        send_smtp(&account, &input, reply_context.as_ref())?;
+        send_smtp(&account, &outbound)?;
+        match append_imap_sent_copy(&account, &outbound.formatted()) {
+            Ok(folder) => debug(
+                app,
+                format!(
+                    "SMTP sent copy appended email={} folder={folder}",
+                    account.email
+                ),
+            ),
+            Err(error) => debug(
+                app,
+                format!(
+                    "SMTP sent copy append failed email={} error={error}",
+                    account.email
+                ),
+            ),
+        }
     }
 
     let sent = NewMessage {
-        provider_message_id: format!("local-sent-{}", Uuid::new_v4()),
+        provider_message_id: format!("local-sent:{sent_message_id}"),
         thread_id: reply_context
             .as_ref()
             .map(|reply| reply.thread_id.clone())
@@ -2695,12 +2762,11 @@ fn run_send_message(app: &tauri::AppHandle, input: SendInput) -> AppResult<Store
 fn send_gmail(
     state: &State<'_, AppState>,
     account: &StoredAccount,
-    input: &SendInput,
+    outbound: &SmtpMessage,
     reply_context: Option<&ReplyContext>,
 ) -> AppResult<()> {
     let token = gmail_access_token(state, account)?;
-    let raw = raw_reply_message(account, input, reply_context);
-    let encoded = general_purpose::URL_SAFE_NO_PAD.encode(raw.as_bytes());
+    let encoded = general_purpose::URL_SAFE_NO_PAD.encode(outbound.formatted());
     let mut body = serde_json::Map::new();
     body.insert("raw".to_string(), Value::String(encoded));
     if let Some(reply_context) = reply_context {
@@ -2724,11 +2790,33 @@ fn send_gmail(
     Ok(())
 }
 
-fn send_smtp(
+fn build_outbound_message(
     account: &StoredAccount,
     input: &SendInput,
     reply_context: Option<&ReplyContext>,
-) -> AppResult<()> {
+    message_id: &str,
+) -> AppResult<SmtpMessage> {
+    let from = account
+        .email
+        .parse::<Mailbox>()
+        .map_err(|e| e.to_string())?;
+    let to = input.to.parse::<Mailbox>().map_err(|e| e.to_string())?;
+    let mut builder = SmtpMessage::builder()
+        .from(from)
+        .to(to)
+        .subject(&input.subject)
+        .message_id(Some(message_id.to_string()));
+    if let Some(message_id) =
+        reply_context.and_then(|reply| reply_header_id(&reply.provider_message_id))
+    {
+        builder = builder
+            .in_reply_to(message_id.clone())
+            .references(message_id);
+    }
+    builder.body(input.body.clone()).map_err(|e| e.to_string())
+}
+
+fn send_smtp(account: &StoredAccount, outbound: &SmtpMessage) -> AppResult<()> {
     let host = account
         .smtp_host
         .as_deref()
@@ -2741,33 +2829,42 @@ fn send_smtp(
         .password
         .as_deref()
         .ok_or_else(|| "Missing SMTP password".to_string())?;
-    let from = account
-        .email
-        .parse::<Mailbox>()
-        .map_err(|e| e.to_string())?;
-    let to = input.to.parse::<Mailbox>().map_err(|e| e.to_string())?;
-    let mut builder = SmtpMessage::builder()
-        .from(from)
-        .to(to)
-        .subject(&input.subject);
-    if let Some(message_id) =
-        reply_context.and_then(|reply| reply_header_id(&reply.provider_message_id))
-    {
-        builder = builder
-            .in_reply_to(message_id.clone())
-            .references(message_id);
-    }
-    let email = builder
-        .body(input.body.clone())
-        .map_err(|e| e.to_string())?;
     let mailer = SmtpTransport::relay(host)
         .map_err(|e| e.to_string())?
         .port(account.smtp_port.unwrap_or(587) as u16)
         .timeout(Some(Duration::from_secs(30)))
         .credentials(Credentials::new(username.to_string(), password.to_string()))
         .build();
-    mailer.send(&email).map_err(|e| e.to_string())?;
+    mailer.send(outbound).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn append_imap_sent_copy(account: &StoredAccount, raw: &[u8]) -> AppResult<String> {
+    let mut session = open_imap_session(account)?;
+    let flags = [imap::types::Flag::Seen];
+    let mut last_error = None;
+    for folder in ["Sent", "Sent Items", "[Gmail]/Sent Mail"] {
+        match session.append_with_flags(folder, raw, flags.as_slice()) {
+            Ok(()) => {
+                session.logout().ok();
+                return Ok(folder.to_string());
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+    session.logout().ok();
+    Err(last_error.unwrap_or_else(|| "No Sent folder accepted APPEND".to_string()))
+}
+
+fn outbound_message_id(email: &str) -> String {
+    let domain = email
+        .rsplit_once('@')
+        .map(|(_, domain)| domain.trim())
+        .filter(|domain| !domain.is_empty())
+        .unwrap_or("mailwind.local");
+    format!("<{}@{}>", Uuid::new_v4(), domain)
 }
 
 fn reply_context(
@@ -2792,29 +2889,12 @@ fn reply_context(
     .map_err(|e| e.to_string())
 }
 
-fn raw_reply_message(
-    account: &StoredAccount,
-    input: &SendInput,
-    reply_context: Option<&ReplyContext>,
-) -> String {
-    let mut raw = format!(
-        "From: {}\r\nTo: {}\r\nSubject: {}\r\n",
-        account.email, input.to, input.subject
-    );
-    if let Some(message_id) =
-        reply_context.and_then(|reply| reply_header_id(&reply.provider_message_id))
-    {
-        raw.push_str(&format!(
-            "In-Reply-To: {message_id}\r\nReferences: {message_id}\r\n"
-        ));
-    }
-    raw.push_str("Content-Type: text/plain; charset=utf-8\r\n\r\n");
-    raw.push_str(&input.body);
-    raw
-}
-
 fn reply_header_id(provider_message_id: &str) -> Option<String> {
-    if provider_message_id.starts_with("local-sent-") {
+    if let Some(message_id) = provider_message_id.strip_prefix("local-sent:") {
+        let message_id = message_id.trim();
+        if message_id.starts_with('<') && message_id.ends_with('>') {
+            return Some(message_id.to_string());
+        }
         return None;
     }
     if let (Some(start), Some(end)) = (
@@ -2865,7 +2945,7 @@ fn run_delete_message(app: &tauri::AppHandle, input: DeleteInput) -> AppResult<(
         ),
     );
 
-    if !provider_message_id.starts_with("local-sent-") {
+    if !is_local_sent_id(&provider_message_id) {
         if account.provider == "gmail" {
             delete_gmail_message(&state, &account, &provider_message_id, permanent)?;
         } else {
@@ -2902,7 +2982,7 @@ fn delete_gmail_message(
     provider_message_id: &str,
     permanent: bool,
 ) -> AppResult<()> {
-    if provider_message_id.starts_with("local-sent-") {
+    if is_local_sent_id(provider_message_id) {
         return Ok(());
     }
     let token = gmail_access_token(state, account)?;
@@ -3132,7 +3212,7 @@ fn run_mark_message_read(app: &tauri::AppHandle, input: MarkReadInput) -> AppRes
         )
     };
 
-    if !provider_message_id.starts_with("local-sent-") {
+    if !is_local_sent_id(&provider_message_id) {
         if account.provider == "gmail" {
             mark_gmail_message_read(&state, &account, &provider_message_id, input.is_read)?;
         } else {
