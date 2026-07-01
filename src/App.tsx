@@ -1,7 +1,17 @@
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type CSSProperties,
+  type KeyboardEvent,
+  type SyntheticEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { setTheme as setAppTheme } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   isPermissionGranted,
   requestPermission,
@@ -118,6 +128,12 @@ const themeOptions = [
   { label: "Rose", value: "#e11d48" },
   { label: "Amber", value: "#d97706" },
 ];
+const themeStorageKey = "mailwind-theme";
+const themeOverrideStorageKey = "mailwind-theme-override";
+
+function systemPrefersDark() {
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false;
+}
 
 function hexToRgb(value: string) {
   const clean = value.replace("#", "");
@@ -137,7 +153,16 @@ function App() {
   const [selectedMessage, setSelectedMessage] = useState<MailMessage | null>(null);
   const [view, setView] = useState<AppView>("mail");
   const [darkMode, setDarkMode] = useState(
-    () => window.localStorage.getItem("mailwind-theme") === "dark",
+    () => {
+      const hasOverride = window.localStorage.getItem(themeOverrideStorageKey) === "true";
+      const stored = window.localStorage.getItem(themeStorageKey);
+      if (hasOverride && stored === "dark") return true;
+      if (hasOverride && stored === "light") return false;
+      return systemPrefersDark();
+    },
+  );
+  const [themeOverridden, setThemeOverridden] = useState(
+    () => window.localStorage.getItem(themeOverrideStorageKey) === "true",
   );
   const [accentColor, setAccentColor] = useState(
     () => window.localStorage.getItem("mailwind-accent") || themeOptions[0].value,
@@ -153,6 +178,9 @@ function App() {
   );
   const [editingAccountId, setEditingAccountId] = useState<number | null>(null);
   const [accountEditForm, setAccountEditForm] = useState<ImapSettingsForm | null>(null);
+  const messageListRef = useRef<HTMLDivElement | null>(null);
+  const messageRowRefs = useRef<Record<number, HTMLButtonElement | null>>({});
+  const leftAltDownRef = useRef(false);
   const composerBodyRef = useRef<HTMLTextAreaElement | null>(null);
   const [gmailForm, setGmailForm] = useState({ client_id: "", client_secret: "" });
   const [imapForm, setImapForm] = useState({
@@ -178,8 +206,30 @@ function App() {
   }, [folder, accountId, page, readFilter]);
 
   useEffect(() => {
-    window.localStorage.setItem("mailwind-theme", darkMode ? "dark" : "light");
-  }, [darkMode]);
+    if (themeOverridden) {
+      window.localStorage.setItem(themeOverrideStorageKey, "true");
+      window.localStorage.setItem(themeStorageKey, darkMode ? "dark" : "light");
+    }
+    document.documentElement.style.colorScheme = darkMode ? "dark" : "light";
+    void setAppTheme(darkMode || systemPrefersDark() ? "dark" : "light").catch(() => {
+      // Browser-only Vite previews do not have the Tauri app API.
+    });
+  }, [darkMode, themeOverridden]);
+
+  useEffect(() => {
+    if (!window.matchMedia) return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (event: MediaQueryListEvent) => {
+      if (!themeOverridden) {
+        setDarkMode(event.matches);
+      }
+      void setAppTheme(darkMode || event.matches ? "dark" : "light").catch(() => {
+        // Browser-only Vite previews do not have the Tauri app API.
+      });
+    };
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, [darkMode, themeOverridden]);
 
   useEffect(() => {
     window.localStorage.setItem("mailwind-accent", accentColor);
@@ -191,6 +241,41 @@ function App() {
       notificationsEnabled ? "enabled" : "disabled",
     );
   }, [notificationsEnabled]);
+
+  useEffect(() => {
+    const resetLeftAlt = () => {
+      leftAltDownRef.current = false;
+    };
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.code === "AltLeft") {
+        leftAltDownRef.current = true;
+        return;
+      }
+      if (
+        leftAltDownRef.current &&
+        event.altKey &&
+        (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+        !isEditableTarget(event.target)
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        selectAdjacentFolder(event.key === "ArrowUp" ? -1 : 1);
+      }
+    };
+    const onKeyUp = (event: globalThis.KeyboardEvent) => {
+      if (event.code === "AltLeft") {
+        resetLeftAlt();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", resetLeftAlt);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", resetLeftAlt);
+    };
+  }, [folder, snapshot.folders]);
 
   useEffect(() => {
     let cleanupDebug: (() => void) | undefined;
@@ -340,6 +425,76 @@ function App() {
     }
   }
 
+  async function selectAndFocusMessage(message: MailMessage) {
+    await selectMessage(message);
+    window.setTimeout(() => {
+      messageRowRefs.current[message.id]?.focus();
+      messageRowRefs.current[message.id]?.scrollIntoView({
+        block: "nearest",
+        inline: "nearest",
+      });
+    }, 0);
+  }
+
+  function selectAdjacentFolder(direction: -1 | 1) {
+    const folders = snapshot.folders.map((item) => item.name);
+    if (!folders.length) return;
+    const currentIndex = Math.max(0, folders.indexOf(folder));
+    const nextIndex = Math.min(folders.length - 1, Math.max(0, currentIndex + direction));
+    const nextFolder = folders[nextIndex];
+    if (nextFolder && nextFolder !== folder) {
+      selectFolder(nextFolder);
+    }
+  }
+
+  function handleMessageListKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (
+      leftAltDownRef.current &&
+      event.altKey &&
+      (event.key === "ArrowUp" || event.key === "ArrowDown")
+    ) {
+      return;
+    }
+
+    if (!["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (event.key === "ArrowLeft") {
+      if (page > 0) {
+        setSelectedId(null);
+        setSelectedMessage(null);
+        setPage((value) => Math.max(0, value - 1));
+        window.setTimeout(() => messageListRef.current?.focus(), 0);
+      }
+      return;
+    }
+
+    if (event.key === "ArrowRight") {
+      if (page + 1 < pageCount) {
+        setSelectedId(null);
+        setSelectedMessage(null);
+        setPage((value) => Math.min(pageCount - 1, value + 1));
+        window.setTimeout(() => messageListRef.current?.focus(), 0);
+      }
+      return;
+    }
+
+    if (!snapshot.messages.length) return;
+    const currentIndex = selectedId
+      ? snapshot.messages.findIndex((message) => message.id === selectedId)
+      : -1;
+    const nextIndex =
+      event.key === "ArrowDown"
+        ? Math.min(snapshot.messages.length - 1, currentIndex < 0 ? 0 : currentIndex + 1)
+        : Math.max(0, currentIndex < 0 ? snapshot.messages.length - 1 : currentIndex - 1);
+    const nextMessage = snapshot.messages[nextIndex];
+    if (nextMessage) {
+      void selectAndFocusMessage(nextMessage);
+    }
+  }
+
   async function markRead(message: MailMessage, isRead: boolean, reloadAfter = true) {
     setSnapshot((current) => ({
       ...current,
@@ -455,6 +610,37 @@ function App() {
     } catch (error) {
       pushDebug(`Notification error: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  async function openEmailLink(rawUrl: string) {
+    const url = safeExternalUrl(rawUrl);
+    if (!url) {
+      setStatus("Blocked unsafe email link");
+      pushDebug(`Blocked unsafe email link: ${rawUrl}`);
+      return;
+    }
+    try {
+      await openUrl(url);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(`Could not open link: ${message}`);
+      pushDebug(`Open link error: ${message}`);
+    }
+  }
+
+  function handleEmailFrameLoad(event: SyntheticEvent<HTMLIFrameElement>) {
+    const doc = event.currentTarget.contentDocument;
+    if (!doc) return;
+    doc.addEventListener("click", (clickEvent) => {
+      if (!(clickEvent.target instanceof Element)) return;
+      const anchor = clickEvent.target.closest("a[href]");
+      if (!(anchor instanceof HTMLAnchorElement)) return;
+      const rawHref = anchor.getAttribute("href") ?? "";
+      const url = safeExternalUrl(rawHref) ?? safeExternalUrl(anchor.href);
+      if (!url) return;
+      clickEvent.preventDefault();
+      void openEmailLink(url);
+    });
   }
 
   async function deleteSelected() {
@@ -574,7 +760,10 @@ function App() {
   } as CSSProperties;
 
   return (
-    <main className={darkMode ? "shell dark" : "shell"} style={shellStyle}>
+    <main
+      className={darkMode ? "shell dark" : "shell"}
+      style={shellStyle}
+    >
       <header className="topbar">
         <div className="topbar-brand">
           <div className="brand">
@@ -695,7 +884,10 @@ function App() {
               <input
                 type="checkbox"
                 checked={darkMode}
-                onChange={(event) => setDarkMode(event.currentTarget.checked)}
+                onChange={(event) => {
+                  setThemeOverridden(true);
+                  setDarkMode(event.currentTarget.checked);
+                }}
               />
             </label>
             <label className="toggle-row">
@@ -923,16 +1115,31 @@ function App() {
           ))}
         </div>
 
-        <div className="message-list">
+        <div
+          aria-label="Email list"
+          aria-activedescendant={selected ? `message-row-${selected.id}` : undefined}
+          className="message-list"
+          onKeyDown={handleMessageListKeyDown}
+          ref={messageListRef}
+          role="listbox"
+          tabIndex={0}
+        >
           {snapshot.messages.map((message) => (
             <button
+              aria-selected={message.id === selected?.id}
               className={[
                 "message-row",
                 message.is_read ? "read" : "unread",
                 message.id === selected?.id ? "selected" : "",
               ].join(" ")}
+              id={`message-row-${message.id}`}
               key={message.id}
-              onClick={() => void selectMessage(message)}
+              onClick={() => void selectAndFocusMessage(message)}
+              ref={(node) => {
+                messageRowRefs.current[message.id] = node;
+              }}
+              role="option"
+              tabIndex={-1}
             >
               <span className="avatar" style={{ backgroundColor: colorForInitials(initialsFor(message.from_addr || message.account_email)), color: "#fff" }}>{initialsFor(message.from_addr || message.account_email)}</span>
               <div className="message-row-content">
@@ -944,7 +1151,7 @@ function App() {
                   {messageCategory(message) ? <small className="message-tag">{messageCategory(message)}</small> : null}
                 </div>
                 <strong className={message.is_read ? undefined : "unread-subject"}>{message.subject}</strong>
-                <p>{plainPreview(message.snippet || message.body)}</p>
+                <p>{message.snippet || "(no preview)"}</p>
                 <div className="row-meta">
                   <small className="row-meta-email">{message.account_email}</small>
                   <div className="row-meta-right">
@@ -1043,8 +1250,9 @@ function App() {
             {selectedIsHtml ? (
               <iframe
                 className="html-body"
-                sandbox=""
+                sandbox="allow-same-origin"
                 title="Email HTML body"
+                onLoad={handleEmailFrameLoad}
                 srcDoc={sanitizeHtml(selected.body)}
               />
             ) : (
@@ -1140,16 +1348,6 @@ function formatBytes(size: number) {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function plainPreview(value: string) {
-  return value
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 180);
-}
-
 function shortName(value: string) {
   const trimmed = value.trim();
   if (!trimmed) return "Unknown sender";
@@ -1234,10 +1432,39 @@ function sanitizeHtml(value: string) {
     }
   });
   doc.querySelectorAll("a").forEach((node) => {
-    node.setAttribute("target", "_blank");
-    node.setAttribute("rel", "noreferrer");
+    const href = node.getAttribute("href") ?? "";
+    const safeHref = safeExternalUrl(href);
+    if (safeHref) {
+      node.setAttribute("href", safeHref);
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noreferrer noopener");
+    } else {
+      node.removeAttribute("href");
+    }
   });
   return `<!doctype html><html><head><base target="_blank"><style>html{background:#fff}body{box-sizing:border-box;margin:0;padding:34px 44px;color:#1f2937;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}img{max-width:100%;height:auto}table{max-width:100%}@media(max-width:700px){body{padding:22px}}</style></head><body>${doc.body.innerHTML}</body></html>`;
+}
+
+function safeExternalUrl(value: string) {
+  let candidate = value.trim().replace(/[\u0000-\u001f\u007f\s]+/g, "");
+  if (!candidate || candidate.startsWith("#")) return "";
+  if (/^www\./i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+  try {
+    const url = new URL(candidate);
+    if (url.protocol === "http:" || url.protocol === "https:" || url.protocol === "mailto:") {
+      return url.toString();
+    }
+  } catch {
+    return "";
+  }
+  return "";
+}
+
+function isEditableTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest("input, textarea, select, [contenteditable='true']"));
 }
 
 function isHtmlMessage(message: MailMessage) {

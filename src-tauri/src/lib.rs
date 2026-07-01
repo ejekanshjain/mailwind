@@ -377,32 +377,9 @@ fn init_db(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Err
             ON attachments(message_id);
         ",
     )?;
-    ensure_column(
-        &conn,
-        "messages",
-        "body_mime",
-        "ALTER TABLE messages ADD COLUMN body_mime TEXT NOT NULL DEFAULT 'text/plain'",
-    )?;
     conn.execute_batch("PRAGMA optimize;")?;
 
     Ok(conn)
-}
-
-fn ensure_column(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    alter_sql: &str,
-) -> Result<(), rusqlite::Error> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for name in columns {
-        if name? == column {
-            return Ok(());
-        }
-    }
-    conn.execute(alter_sql, [])?;
-    Ok(())
 }
 
 fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAccount> {
@@ -2526,7 +2503,7 @@ fn imap_to_message(
         .unwrap_or_else(now_ts);
     let (body, body_mime) = parsed_body(&parsed);
     let attachments = parsed_attachments(&parsed);
-    let snippet = body.chars().take(180).collect::<String>();
+    let snippet = snippet_for_body(&body, &body_mime);
     Ok(NewMessage {
         provider_message_id: imap_provider_message_id(folder, uid, &provider_message_id),
         thread_id: format!("{folder}:{uid}"),
@@ -2542,6 +2519,89 @@ fn imap_to_message(
         is_read,
         attachments,
     })
+}
+
+fn snippet_for_body(body: &str, body_mime: &str) -> String {
+    let text = if body_mime.eq_ignore_ascii_case("text/html") {
+        html_to_text(body)
+    } else {
+        body.to_string()
+    };
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(180)
+        .collect()
+}
+
+fn html_to_text(value: &str) -> String {
+    const DROPPED_HTML_BLOCKS: &[&str] = &["script", "style", "head", "title"];
+    let cleaned = remove_html_blocks(value, DROPPED_HTML_BLOCKS);
+    let mut text = String::with_capacity(cleaned.len());
+    let mut in_tag = false;
+    let mut in_entity = false;
+    let mut entity = String::new();
+
+    for ch in cleaned.chars() {
+        if in_tag {
+            if ch == '>' {
+                in_tag = false;
+                text.push(' ');
+            }
+            continue;
+        }
+        if in_entity {
+            if ch == ';' {
+                text.push_str(match entity.as_str() {
+                    "nbsp" => " ",
+                    "amp" => "&",
+                    "lt" => "<",
+                    "gt" => ">",
+                    "quot" => "\"",
+                    "#39" | "apos" => "'",
+                    _ => " ",
+                });
+                in_entity = false;
+                entity.clear();
+            } else if entity.len() < 12 {
+                entity.push(ch);
+            } else {
+                in_entity = false;
+                entity.clear();
+            }
+            continue;
+        }
+        match ch {
+            '<' => in_tag = true,
+            '&' => in_entity = true,
+            _ => text.push(ch),
+        }
+    }
+    text
+}
+
+fn remove_html_blocks(value: &str, tags: &[&str]) -> String {
+    let mut output = value.to_string();
+    for tag in tags {
+        loop {
+            let lower = output.to_ascii_lowercase();
+            let Some(start) = lower.find(&format!("<{tag}")) else {
+                break;
+            };
+            let close = format!("</{tag}>");
+            if let Some(relative_end) = lower[start..].find(&close) {
+                let end = start + relative_end + close.len();
+                output.replace_range(start..end, " ");
+            } else if let Some(relative_end) = lower[start..].find('>') {
+                output.replace_range(start..start + relative_end + 1, " ");
+            } else {
+                output.replace_range(start.., " ");
+                break;
+            }
+        }
+    }
+    output
 }
 
 fn imap_provider_message_id(folder: &str, uid: u32, message_id: &str) -> String {
