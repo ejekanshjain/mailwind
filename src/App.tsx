@@ -1,7 +1,6 @@
 import {
   type CSSProperties,
   type KeyboardEvent,
-  type SyntheticEvent,
   useEffect,
   useMemo,
   useRef,
@@ -193,6 +192,8 @@ function App() {
   const [accountEditForm, setAccountEditForm] = useState<ImapSettingsForm | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const messageRowRefs = useRef<Record<number, HTMLButtonElement | null>>({});
+  const emailFrameRef = useRef<HTMLIFrameElement | null>(null);
+  const openEmailLinkRef = useRef<(rawUrl: string) => void>(() => undefined);
   const leftAltDownRef = useRef(false);
   const composerBodyRef = useRef<HTMLTextAreaElement | null>(null);
   const [gmailForm, setGmailForm] = useState({ client_id: "", client_secret: "" });
@@ -284,6 +285,17 @@ function App() {
       window.removeEventListener("blur", resetLeftAlt);
     };
   }, [folder, snapshot.folders]);
+
+  useEffect(() => {
+    const onEmailLinkMessage = (event: MessageEvent) => {
+      if (event.source !== emailFrameRef.current?.contentWindow) return;
+      const href = emailLinkMessageHref(event.data);
+      if (!href) return;
+      openEmailLinkRef.current(href);
+    };
+    window.addEventListener("message", onEmailLinkMessage);
+    return () => window.removeEventListener("message", onEmailLinkMessage);
+  }, []);
 
   useEffect(() => {
     let cleanupDebug: (() => void) | undefined;
@@ -636,20 +648,10 @@ function App() {
     }
   }
 
-  function handleEmailFrameLoad(event: SyntheticEvent<HTMLIFrameElement>) {
-    const doc = event.currentTarget.contentDocument;
-    if (!doc) return;
-    doc.addEventListener("click", (clickEvent) => {
-      if (!(clickEvent.target instanceof Element)) return;
-      const anchor = clickEvent.target.closest("a[href]");
-      if (!(anchor instanceof HTMLAnchorElement)) return;
-      const rawHref = anchor.getAttribute("href") ?? "";
-      const url = safeExternalUrl(rawHref) ?? safeExternalUrl(anchor.href);
-      if (!url) return;
-      clickEvent.preventDefault();
-      void openEmailLink(url);
-    });
-  }
+  openEmailLinkRef.current = (rawUrl: string) => {
+    void openEmailLink(rawUrl);
+  };
+
 
   async function deleteSelected() {
     if (!selected) return;
@@ -1257,10 +1259,10 @@ function App() {
             ) : null}
             {selectedIsHtml ? (
               <iframe
+                ref={emailFrameRef}
                 className="html-body"
-                sandbox="allow-same-origin"
+                sandbox="allow-scripts"
                 title="Email HTML body"
-                onLoad={handleEmailFrameLoad}
                 srcDoc={sanitizeHtml(selected.body)}
               />
             ) : (
@@ -1450,7 +1452,8 @@ function sanitizeHtml(value: string) {
       node.removeAttribute("href");
     }
   });
-  return `<!doctype html><html><head><base target="_blank"><style>html{background:#fff}body{box-sizing:border-box;margin:0;padding:34px 44px;color:#1f2937;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}img{max-width:100%;height:auto}table{max-width:100%}@media(max-width:700px){body{padding:22px}}</style></head><body>${doc.body.innerHTML}</body></html>`;
+  const linkBridgeScript = `<script>(()=>{document.addEventListener("click",(event)=>{const target=event.target;if(!(target instanceof Element))return;const anchor=target.closest("a[href]");if(!anchor)return;event.preventDefault();window.parent.postMessage({type:"mailwind-open-email-link",href:anchor.getAttribute("href")||anchor.href||""},"*");},true);})();<\/script>`;
+  return `<!doctype html><html><head><base target="_blank"><style>html{background:#fff}body{box-sizing:border-box;margin:0;padding:34px 44px;color:#1f2937;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}img{max-width:100%;height:auto}table{max-width:100%}@media(max-width:700px){body{padding:22px}}</style>${linkBridgeScript}</head><body>${doc.body.innerHTML}</body></html>`;
 }
 
 function safeExternalUrl(value: string) {
@@ -1468,6 +1471,15 @@ function safeExternalUrl(value: string) {
     return "";
   }
   return "";
+}
+
+function emailLinkMessageHref(value: unknown) {
+  if (!value || typeof value !== "object") return "";
+  const payload = value as { type?: unknown; href?: unknown };
+  if (payload.type !== "mailwind-open-email-link" || typeof payload.href !== "string") {
+    return "";
+  }
+  return payload.href;
 }
 
 function isEditableTarget(target: EventTarget | null) {
