@@ -24,6 +24,10 @@ use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
 
 type AppResult<T> = Result<T, String>;
+type ImapSession = imap::Session<native_tls::TlsStream<TcpStream>>;
+
+const IMAP_FLAG_FETCH_CHUNK: usize = 100;
+const IMAP_BODY_FETCH_CHUNK: usize = 25;
 
 struct AppState {
     db: Mutex<Connection>,
@@ -271,6 +275,67 @@ fn connect_imap_client(
             .map(|error| error.to_string())
             .unwrap_or_else(|| "no socket addresses found".to_string())
     ))
+}
+
+fn imap_error(error: imap::error::Error) -> String {
+    format!("{error}; details={error:?}")
+}
+
+fn imap_uid_set(uids: &[u32]) -> String {
+    uids.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn imap_uid_summary(uids: &[u32]) -> String {
+    match uids {
+        [] => "-".to_string(),
+        [uid] => uid.to_string(),
+        many => {
+            let first = many.first().copied().unwrap_or_default();
+            let last = many.last().copied().unwrap_or_default();
+            format!("{first}..{last} ({} uids)", many.len())
+        }
+    }
+}
+
+fn select_imap_folder(session: &mut ImapSession, folder: &str) -> AppResult<()> {
+    session
+        .select(folder)
+        .map(|_| ())
+        .map_err(|e| format!("IMAP select failed folder={folder}: {}", imap_error(e)))
+}
+
+fn reopen_imap_folder(account: &StoredAccount, folder: &str) -> AppResult<ImapSession> {
+    let mut session = open_imap_session(account)?;
+    select_imap_folder(&mut session, folder)?;
+    Ok(session)
+}
+
+fn debug_imap_fetch_failure(
+    app: Option<&tauri::AppHandle>,
+    account: &StoredAccount,
+    role: &str,
+    uids: &[u32],
+    query: &str,
+    action: &str,
+    error: &str,
+) {
+    if let Some(app) = app {
+        debug(
+            app,
+            format!(
+                "IMAP fetch failed email={} folder={} uids={} query={} action={} error={}",
+                account.email,
+                role,
+                imap_uid_summary(uids),
+                query,
+                action,
+                error
+            ),
+        );
+    }
 }
 
 fn init_db(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Error>> {
@@ -1746,8 +1811,10 @@ fn poll_imap_inbox(
 ) -> AppResult<(usize, usize)> {
     let mut session = open_imap_session(account)?;
     let folder = "INBOX";
-    session.select(folder).map_err(|e| e.to_string())?;
-    let uids = session.uid_search("UNDELETED").map_err(|e| e.to_string())?;
+    select_imap_folder(&mut session, folder)?;
+    let uids = session
+        .uid_search("UNDELETED")
+        .map_err(|e| format!("IMAP poll search failed: {}", imap_error(e)))?;
     let mut selected = uids.into_iter().collect::<Vec<_>>();
     selected.sort_unstable();
     selected.reverse();
@@ -1778,55 +1845,99 @@ fn poll_imap_inbox(
 
     let mut changed = 0;
     if !existing_uids.is_empty() {
-        let set = existing_uids
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let fetches = session
-            .uid_fetch(set, "(FLAGS)")
-            .map_err(|e| e.to_string())?;
-        for fetch in fetches.iter() {
-            let uid = fetch.uid.unwrap_or(fetch.message);
-            let thread_id = format!("{folder}:{uid}");
-            if fetch.flags().contains(&imap::types::Flag::Deleted) {
-                let conn = state.db.lock().map_err(|e| e.to_string())?;
-                changed += delete_messages_by_thread(&conn, account.id, &thread_id)?;
-                continue;
+        let set = imap_uid_set(&existing_uids);
+        match session.uid_fetch(&set, "(FLAGS)") {
+            Ok(fetches) => {
+                for fetch in fetches.iter() {
+                    let (_, _, item_changed) =
+                        apply_imap_flag_fetch(state, account, folder, fetch, None)?;
+                    changed += item_changed;
+                }
             }
-            let is_read = fetch.flags().contains(&imap::types::Flag::Seen);
-            let conn = state.db.lock().map_err(|e| e.to_string())?;
-            if update_message_read_by_thread(&conn, account.id, &thread_id, is_read)? {
-                changed += 1;
+            Err(error) => {
+                debug_imap_fetch_failure(
+                    None,
+                    account,
+                    "Inbox",
+                    &existing_uids,
+                    "(FLAGS)",
+                    "retry-single",
+                    &imap_error(error),
+                );
+                session.logout().ok();
+                session = reopen_imap_folder(account, folder)?;
+                for uid in &existing_uids {
+                    match session.uid_fetch(uid.to_string(), "(FLAGS)") {
+                        Ok(fetches) => {
+                            for fetch in fetches.iter() {
+                                let (_, _, item_changed) =
+                                    apply_imap_flag_fetch(state, account, folder, fetch, None)?;
+                                changed += item_changed;
+                            }
+                        }
+                        Err(_) => {
+                            session.logout().ok();
+                            session = reopen_imap_folder(account, folder)?;
+                        }
+                    }
+                }
             }
         }
     }
 
     let mut new_messages = 0;
     if !missing_uids.is_empty() {
-        let set = missing_uids
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let fetches = session
-            .uid_fetch(set, "(BODY.PEEK[] FLAGS)")
-            .map_err(|e| e.to_string())?;
-        for fetch in fetches.iter() {
-            let Some(body) = fetch.body() else {
-                continue;
-            };
-            let uid = fetch.uid.unwrap_or(fetch.message);
-            let message = imap_to_message(
-                "Inbox",
-                folder,
-                uid,
-                body,
-                fetch.flags().contains(&imap::types::Flag::Seen),
-            )?;
-            let conn = state.db.lock().map_err(|e| e.to_string())?;
-            upsert_message(&conn, account.id, &message)?;
-            new_messages += 1;
+        let set = imap_uid_set(&missing_uids);
+        match session.uid_fetch(&set, "(BODY.PEEK[] FLAGS)") {
+            Ok(fetches) => {
+                for fetch in fetches.iter() {
+                    if store_imap_body_fetch(None, state, account, "Inbox", folder, fetch)? {
+                        new_messages += 1;
+                    }
+                }
+            }
+            Err(error) => {
+                debug_imap_fetch_failure(
+                    None,
+                    account,
+                    "Inbox",
+                    &missing_uids,
+                    "(BODY.PEEK[] FLAGS)",
+                    "retry-single",
+                    &imap_error(error),
+                );
+                session.logout().ok();
+                session = reopen_imap_folder(account, folder)?;
+                for uid in &missing_uids {
+                    match session.uid_fetch(uid.to_string(), "(BODY.PEEK[] FLAGS)") {
+                        Ok(fetches) => {
+                            for fetch in fetches.iter() {
+                                if store_imap_body_fetch(
+                                    None, state, account, "Inbox", folder, fetch,
+                                )? {
+                                    new_messages += 1;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            session.logout().ok();
+                            session = reopen_imap_folder(account, folder)?;
+                            if let Ok(fetches) = session.uid_fetch(
+                                uid.to_string(),
+                                "(BODY.PEEK[HEADER] BODY.PEEK[TEXT] FLAGS)",
+                            ) {
+                                for fetch in fetches.iter() {
+                                    if store_imap_header_text_fetch(
+                                        None, state, account, "Inbox", folder, fetch,
+                                    )? {
+                                        new_messages += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     session.logout().ok();
@@ -2265,40 +2376,22 @@ fn sync_imap_messages(
     state: &State<'_, AppState>,
     account: &StoredAccount,
 ) -> AppResult<usize> {
-    let host = account
-        .imap_host
-        .as_deref()
-        .ok_or_else(|| "Missing IMAP host".to_string())?;
-    let port = account.imap_port.unwrap_or(993) as u16;
-    let username = account
-        .username
-        .as_deref()
-        .ok_or_else(|| "Missing IMAP username".to_string())?;
-    let password = account
-        .password
-        .as_deref()
-        .ok_or_else(|| "Missing IMAP password".to_string())?;
-    let tls = native_tls::TlsConnector::builder()
-        .build()
-        .map_err(|e| e.to_string())?;
-    let client = connect_imap_client(host, port, &tls)?;
-    let mut session = client
-        .login(username, password)
-        .map_err(|e| format!("IMAP login failed or timed out after 15s: {}", e.0))?;
+    let mut session = open_imap_session(account)?;
     let folders = [
         ("Inbox", vec!["INBOX"]),
         ("Sent", vec!["Sent", "Sent Items", "[Gmail]/Sent Mail"]),
         ("Trash", vec!["Trash", "Deleted Items", "[Gmail]/Trash"]),
     ];
     let mut count = 0;
-    let chunk_size = 100;
 
     for (role, candidates) in folders {
         for folder in candidates {
             if session.select(folder).is_err() {
                 continue;
             }
-            let uids = session.uid_search("UNDELETED").map_err(|e| e.to_string())?;
+            let uids = session
+                .uid_search("UNDELETED")
+                .map_err(|e| format!("IMAP search failed folder={role}: {}", imap_error(e)))?;
             let mut selected = uids.into_iter().collect::<Vec<_>>();
             selected.sort_unstable();
             selected.reverse();
@@ -2350,34 +2443,67 @@ fn sync_imap_messages(
             let mut flag_checked = 0;
             let mut deleted_existing = 0;
 
-            for chunk in existing_uids.chunks(chunk_size) {
-                let set = chunk
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let fetches = session
-                    .uid_fetch(set, "(FLAGS)")
-                    .map_err(|e| e.to_string())?;
-                for fetch in fetches.iter() {
-                    let uid = fetch.uid.unwrap_or(fetch.message);
-                    let thread_id = format!("{folder}:{uid}");
-                    if fetch.flags().contains(&imap::types::Flag::Deleted) {
-                        upstream_threads.remove(&thread_id);
-                        let conn = state.db.lock().map_err(|e| e.to_string())?;
-                        deleted_existing +=
-                            delete_messages_by_thread(&conn, account.id, &thread_id)?;
-                        flag_checked += 1;
+            for chunk in existing_uids.chunks(IMAP_FLAG_FETCH_CHUNK) {
+                let set = imap_uid_set(chunk);
+                let fetches = match session.uid_fetch(&set, "(FLAGS)") {
+                    Ok(fetches) => fetches,
+                    Err(error) => {
+                        let detail = imap_error(error);
+                        debug_imap_fetch_failure(
+                            app,
+                            account,
+                            role,
+                            chunk,
+                            "(FLAGS)",
+                            "retry-single",
+                            &detail,
+                        );
+                        session.logout().ok();
+                        session = reopen_imap_folder(account, folder)?;
+                        for uid in chunk {
+                            match session.uid_fetch(uid.to_string(), "(FLAGS)") {
+                                Ok(fetches) => {
+                                    for fetch in fetches.iter() {
+                                        let (checked, deleted, _) = apply_imap_flag_fetch(
+                                            state,
+                                            account,
+                                            folder,
+                                            fetch,
+                                            Some(&mut upstream_threads),
+                                        )?;
+                                        flag_checked += checked;
+                                        deleted_existing += deleted;
+                                    }
+                                }
+                                Err(error) => {
+                                    let detail = imap_error(error);
+                                    debug_imap_fetch_failure(
+                                        app,
+                                        account,
+                                        role,
+                                        &[*uid],
+                                        "(FLAGS)",
+                                        "skip-uid",
+                                        &detail,
+                                    );
+                                    session.logout().ok();
+                                    session = reopen_imap_folder(account, folder)?;
+                                }
+                            }
+                        }
                         continue;
                     }
-                    let is_read = fetch.flags().contains(&imap::types::Flag::Seen);
-                    let conn = state.db.lock().map_err(|e| e.to_string())?;
-                    conn.execute(
-                        "UPDATE messages SET is_read = ?, updated_at = ? WHERE account_id = ? AND thread_id = ?",
-                        params![if is_read { 1 } else { 0 }, now_ts(), account.id, thread_id],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    flag_checked += 1;
+                };
+                for fetch in fetches.iter() {
+                    let (checked, deleted, _) = apply_imap_flag_fetch(
+                        state,
+                        account,
+                        folder,
+                        fetch,
+                        Some(&mut upstream_threads),
+                    )?;
+                    flag_checked += checked;
+                    deleted_existing += deleted;
                 }
             }
             let removed = {
@@ -2400,45 +2526,102 @@ fn sync_imap_messages(
             }
             let mut folder_count = 0;
             let mut processed = 0;
-            for chunk in missing_uids.chunks(chunk_size) {
-                let set = chunk
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let fetches = session
-                    .uid_fetch(set, "(BODY.PEEK[] FLAGS)")
-                    .map_err(|e| e.to_string())?;
-                for fetch in fetches.iter() {
-                    let Some(body) = fetch.body() else {
-                        continue;
-                    };
-                    let uid = fetch.uid.unwrap_or(fetch.message);
-                    let message = match imap_to_message(
-                        role,
-                        folder,
-                        uid,
-                        body,
-                        fetch.flags().contains(&imap::types::Flag::Seen),
-                    ) {
-                        Ok(message) => message,
-                        Err(error) => {
+            for chunk in missing_uids.chunks(IMAP_BODY_FETCH_CHUNK) {
+                let set = imap_uid_set(chunk);
+                let fetches = match session.uid_fetch(&set, "(BODY.PEEK[] FLAGS)") {
+                    Ok(fetches) => fetches,
+                    Err(error) => {
+                        let detail = imap_error(error);
+                        debug_imap_fetch_failure(
+                            app,
+                            account,
+                            role,
+                            chunk,
+                            "(BODY.PEEK[] FLAGS)",
+                            "retry-single",
+                            &detail,
+                        );
+                        session.logout().ok();
+                        session = reopen_imap_folder(account, folder)?;
+                        for uid in chunk {
+                            match session.uid_fetch(uid.to_string(), "(BODY.PEEK[] FLAGS)") {
+                                Ok(fetches) => {
+                                    for fetch in fetches.iter() {
+                                        if store_imap_body_fetch(
+                                            app, state, account, role, folder, fetch,
+                                        )? {
+                                            count += 1;
+                                            folder_count += 1;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    let detail = imap_error(error);
+                                    debug_imap_fetch_failure(
+                                        app,
+                                        account,
+                                        role,
+                                        &[*uid],
+                                        "(BODY.PEEK[] FLAGS)",
+                                        "retry-header-text",
+                                        &detail,
+                                    );
+                                    session.logout().ok();
+                                    session = reopen_imap_folder(account, folder)?;
+                                    match session.uid_fetch(
+                                        uid.to_string(),
+                                        "(BODY.PEEK[HEADER] BODY.PEEK[TEXT] FLAGS)",
+                                    ) {
+                                        Ok(fetches) => {
+                                            for fetch in fetches.iter() {
+                                                if store_imap_header_text_fetch(
+                                                    app, state, account, role, folder, fetch,
+                                                )? {
+                                                    count += 1;
+                                                    folder_count += 1;
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let detail = imap_error(error);
+                                            debug_imap_fetch_failure(
+                                                app,
+                                                account,
+                                                role,
+                                                &[*uid],
+                                                "(BODY.PEEK[HEADER] BODY.PEEK[TEXT] FLAGS)",
+                                                "skip-uid",
+                                                &detail,
+                                            );
+                                            session.logout().ok();
+                                            session = reopen_imap_folder(account, folder)?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        processed += chunk.len();
+                        if processed % 500 == 0 || processed >= missing_uids.len() {
                             if let Some(app) = app {
                                 debug(
                                     app,
                                     format!(
-                                        "IMAP skipped unparsable message email={} folder={} uid={} error={}",
-                                        account.email, role, uid, error
+                                        "IMAP sync progress email={} folder={} fetched={processed}/{} written={folder_count}",
+                                        account.email,
+                                        role,
+                                        missing_uids.len()
                                     ),
                                 );
                             }
-                            continue;
                         }
-                    };
-                    let conn = state.db.lock().map_err(|e| e.to_string())?;
-                    upsert_message(&conn, account.id, &message)?;
-                    count += 1;
-                    folder_count += 1;
+                        continue;
+                    }
+                };
+                for fetch in fetches.iter() {
+                    if store_imap_body_fetch(app, state, account, role, folder, fetch)? {
+                        count += 1;
+                        folder_count += 1;
+                    }
                 }
                 processed += chunk.len();
                 if processed % 500 == 0 || processed >= missing_uids.len() {
@@ -2460,6 +2643,116 @@ fn sync_imap_messages(
     }
     session.logout().ok();
     Ok(count)
+}
+
+fn apply_imap_flag_fetch(
+    state: &State<'_, AppState>,
+    account: &StoredAccount,
+    folder: &str,
+    fetch: &imap::types::Fetch,
+    upstream_threads: Option<&mut HashSet<String>>,
+) -> AppResult<(usize, usize, usize)> {
+    let uid = fetch.uid.unwrap_or(fetch.message);
+    let thread_id = format!("{folder}:{uid}");
+    if fetch.flags().contains(&imap::types::Flag::Deleted) {
+        if let Some(upstream_threads) = upstream_threads {
+            upstream_threads.remove(&thread_id);
+        }
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let deleted = delete_messages_by_thread(&conn, account.id, &thread_id)?;
+        return Ok((1, deleted, deleted));
+    }
+
+    let is_read = fetch.flags().contains(&imap::types::Flag::Seen);
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    let changed = if update_message_read_by_thread(&conn, account.id, &thread_id, is_read)? {
+        1
+    } else {
+        0
+    };
+    Ok((1, 0, changed))
+}
+
+fn store_imap_body_fetch(
+    app: Option<&tauri::AppHandle>,
+    state: &State<'_, AppState>,
+    account: &StoredAccount,
+    role: &str,
+    folder: &str,
+    fetch: &imap::types::Fetch,
+) -> AppResult<bool> {
+    let Some(body) = fetch.body() else {
+        return Ok(false);
+    };
+    let uid = fetch.uid.unwrap_or(fetch.message);
+    store_imap_raw_message(
+        app,
+        state,
+        account,
+        role,
+        folder,
+        uid,
+        body,
+        fetch.flags().contains(&imap::types::Flag::Seen),
+    )
+}
+
+fn store_imap_header_text_fetch(
+    app: Option<&tauri::AppHandle>,
+    state: &State<'_, AppState>,
+    account: &StoredAccount,
+    role: &str,
+    folder: &str,
+    fetch: &imap::types::Fetch,
+) -> AppResult<bool> {
+    let (Some(header), Some(text)) = (fetch.header(), fetch.text()) else {
+        return Ok(false);
+    };
+    let mut raw = Vec::with_capacity(header.len() + text.len() + 2);
+    raw.extend_from_slice(header);
+    raw.extend_from_slice(b"\r\n");
+    raw.extend_from_slice(text);
+    let uid = fetch.uid.unwrap_or(fetch.message);
+    store_imap_raw_message(
+        app,
+        state,
+        account,
+        role,
+        folder,
+        uid,
+        &raw,
+        fetch.flags().contains(&imap::types::Flag::Seen),
+    )
+}
+
+fn store_imap_raw_message(
+    app: Option<&tauri::AppHandle>,
+    state: &State<'_, AppState>,
+    account: &StoredAccount,
+    role: &str,
+    folder: &str,
+    uid: u32,
+    raw: &[u8],
+    is_read: bool,
+) -> AppResult<bool> {
+    let message = match imap_to_message(role, folder, uid, raw, is_read) {
+        Ok(message) => message,
+        Err(error) => {
+            if let Some(app) = app {
+                debug(
+                    app,
+                    format!(
+                        "IMAP skipped unparsable message email={} folder={} uid={} error={}",
+                        account.email, role, uid, error
+                    ),
+                );
+            }
+            return Ok(false);
+        }
+    };
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    upsert_message(&conn, account.id, &message)?;
+    Ok(true)
 }
 
 fn imap_to_message(
