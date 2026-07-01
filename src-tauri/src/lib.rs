@@ -2483,8 +2483,8 @@ fn snippet_for_body(body: &str, body_mime: &str) -> String {
 }
 
 fn html_to_text(value: &str) -> String {
-    const DROPPED_HTML_BLOCKS: &[&str] = &["script", "style", "head", "title"];
-    let cleaned = remove_html_blocks(value, DROPPED_HTML_BLOCKS);
+    const DROPPED_HTML_BLOCKS: [&str; 4] = ["script", "style", "head", "title"];
+    let cleaned = remove_html_blocks(value, DROPPED_HTML_BLOCKS.as_slice());
     let mut text = String::with_capacity(cleaned.len());
     let mut in_tag = false;
     let mut in_entity = false;
