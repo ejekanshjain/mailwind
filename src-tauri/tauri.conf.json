@@ -16,7 +16,8 @@
         "width": 1320,
         "height": 860,
         "minWidth": 1080,
-        "minHeight": 720
+        "minHeight": 720,
+        "theme": "dark"
       }
     ],
     "security": {

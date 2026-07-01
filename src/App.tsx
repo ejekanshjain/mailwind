@@ -12,6 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   isPermissionGranted,
   requestPermission,
@@ -141,6 +142,18 @@ function hexToRgb(value: string) {
   return `${(numeric >> 16) & 255}, ${(numeric >> 8) & 255}, ${numeric & 255}`;
 }
 
+function applyNativeTheme(dark: boolean) {
+  const theme = dark ? "dark" : "light";
+  document.documentElement.style.colorScheme = theme;
+  document.documentElement.classList.toggle("dark", dark);
+  void Promise.all([
+    setAppTheme(theme),
+    getCurrentWindow().setTheme(theme),
+  ]).catch(() => {
+    // Browser-only Vite previews do not have the Tauri window/app APIs.
+  });
+}
+
 function App() {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [folder, setFolder] = useState("Inbox");
@@ -210,10 +223,7 @@ function App() {
       window.localStorage.setItem(themeOverrideStorageKey, "true");
       window.localStorage.setItem(themeStorageKey, darkMode ? "dark" : "light");
     }
-    document.documentElement.style.colorScheme = darkMode ? "dark" : "light";
-    void setAppTheme(darkMode || systemPrefersDark() ? "dark" : "light").catch(() => {
-      // Browser-only Vite previews do not have the Tauri app API.
-    });
+    applyNativeTheme(darkMode);
   }, [darkMode, themeOverridden]);
 
   useEffect(() => {
@@ -222,14 +232,12 @@ function App() {
     const onChange = (event: MediaQueryListEvent) => {
       if (!themeOverridden) {
         setDarkMode(event.matches);
+        applyNativeTheme(event.matches);
       }
-      void setAppTheme(darkMode || event.matches ? "dark" : "light").catch(() => {
-        // Browser-only Vite previews do not have the Tauri app API.
-      });
     };
     media.addEventListener("change", onChange);
     return () => media.removeEventListener("change", onChange);
-  }, [darkMode, themeOverridden]);
+  }, [themeOverridden]);
 
   useEffect(() => {
     window.localStorage.setItem("mailwind-accent", accentColor);
