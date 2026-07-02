@@ -2297,6 +2297,7 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "time",
+ "url",
  "urlencoding",
  "uuid",
 ]

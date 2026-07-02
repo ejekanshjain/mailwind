@@ -4,7 +4,7 @@ Mailwind is a local-first desktop email app for people who manage more than one 
 
 It brings Gmail, Google Workspace, and generic IMAP/SMTP accounts into one fast workspace with a unified inbox, local search, sending, replies, read state, delete actions, attachments, and desktop notifications. The app is built with Tauri, React, TypeScript, Rust, and SQLite.
 
-> Current status: early MVP. Mailwind is usable for local development and testing, but credentials are currently stored in the local SQLite database rather than an OS keychain.
+> Current status: early MVP. Mailwind is usable for local development and testing. Account secrets are stored through the operating system credential store when available; synced message bodies and locally cached attachment blobs are still stored in plaintext SQLite.
 
 ## Why Mailwind
 
@@ -33,6 +33,7 @@ Most email clients are either browser tabs, provider-specific apps, or heavy des
 - Desktop notifications for new mail.
 - Visible debug log panel for connection, sync, and mail-action troubleshooting.
 - Linux `deb` and `rpm` bundle targets configured.
+- UI-side mailbox snapshot caching with stale-response guards for fast folder/account switching.
 
 ## Tech Stack
 
@@ -113,7 +114,7 @@ Build desktop bundles:
 bun run tauri build
 ```
 
-The current Tauri config builds Linux `deb` and `rpm` packages.
+The current Tauri config builds Linux `deb` and `rpm` packages. AppImage is not part of the default beta bundle target because the verified local packaging path is `deb`/`rpm`.
 
 ## Connecting Gmail
 
@@ -154,13 +155,23 @@ Mailwind stores synced mail locally in SQLite under the operating system app dat
 mailwind.sqlite3
 ```
 
-The database currently stores account tokens and IMAP/SMTP credentials. Do not commit local data files, share a development profile, or use sensitive production mailboxes until secure credential storage is added.
+Account tokens, OAuth client secrets, and IMAP/SMTP passwords are migrated out of SQLite and stored through the OS credential store using the `com.mailwind.desktop` service namespace. If the operating system keyring or Secret Service is unavailable, account setup fails instead of silently keeping new secrets in SQLite.
+
+Synced email content remains local but is not encrypted by Mailwind yet: message bodies are stored in SQLite, and IMAP attachment bytes can be stored as local blobs. Do not use sensitive production mailboxes until the local mail encryption/privacy decision is complete.
+
+## Current MVP Limitations
+
+- Gmail setup still expects the user to provide a Google OAuth client ID and secret.
+- Sync is reliable for development mailboxes but does not yet use Gmail history cursors or IMAP UID high-water marks.
+- Sending supports multiple To recipients plus CC, BCC, Reply-To, reply, reply-all, and forward composition. Draft autosave, an outbox retry queue, scheduled send, and outgoing attachments are still planned.
+- Provider-specific Outlook/Microsoft Graph and iCloud preset flows are not implemented yet.
+- Local mail storage encryption, retention controls, signing/notarization, and auto-update are not implemented yet.
 
 ## Development Notes
 
 - The frontend talks to Rust through Tauri commands.
 - `src-tauri/src/lib.rs` owns account storage, Gmail OAuth, IMAP/SMTP, sync, sending, read/delete actions, attachment download, and SQLite queries.
-- Mailbox navigation uses indexed SQLite queries and a small UI-side snapshot cache for snappier switching.
+- Mailbox navigation uses indexed SQLite queries and a UI-side snapshot cache with stale-response guards for snappier switching.
 - Sync runs in the background and can process multiple accounts concurrently.
 - Debug events are emitted through the `mailwind-debug` Tauri event and shown in the UI.
 
@@ -197,7 +208,7 @@ Good first areas:
 
 - Provider presets for common IMAP/SMTP hosts.
 - UI polish and accessibility improvements.
-- Secure credential storage.
+- Local mail storage encryption and retention controls.
 - Test coverage for sync, search, and mail actions.
 - Packaging improvements for macOS, Windows, and Linux.
 

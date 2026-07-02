@@ -33,6 +33,7 @@ open = "5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 time = "=0.3.36"
+url = "2"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
 tauri-plugin-dialog = "2"

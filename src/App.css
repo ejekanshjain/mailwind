@@ -469,6 +469,39 @@ button {
   content: "";
 }
 
+.mailbox-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  padding: 8px 18px;
+  color: #92400e;
+  background: #fffbeb;
+  border-bottom: 1px solid #fde68a;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.mailbox-error span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mailbox-error button {
+  flex: 0 0 auto;
+  height: 28px;
+  padding: 0 10px;
+  color: #78350f;
+  background: #ffffff;
+  border: 1px solid #f59e0b;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 850;
+}
+
 .message-list {
   flex: 1;
   min-height: 0;
@@ -1195,6 +1228,10 @@ button {
 
 .composer-grid {
   grid-template-columns: minmax(145px, 0.7fr) 1fr 1fr;
+}
+
+.composer-grid input:last-child {
+  grid-column: 1 / -1;
 }
 
 .composer .primary {

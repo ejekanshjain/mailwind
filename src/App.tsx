@@ -36,6 +36,7 @@ import {
   Palette,
   Paperclip,
   PenLine,
+  ReplyAll,
   RefreshCw,
   RemoveFormatting,
   Search,
@@ -125,6 +126,9 @@ type AppView = "mail" | "settings";
 type ComposerState = {
   account_id: string;
   to: string;
+  cc: string;
+  bcc: string;
+  reply_to: string;
   subject: string;
   body: string;
   body_mime: string;
@@ -154,6 +158,9 @@ const emptySnapshot: Snapshot = {
 const emptyComposer: ComposerState = {
   account_id: "",
   to: "",
+  cc: "",
+  bcc: "",
+  reply_to: "",
   subject: "",
   body: "",
   body_mime: "text/html",
@@ -216,6 +223,7 @@ function App() {
     () => window.localStorage.getItem("mailwind-accent") || themeOptions[0].value,
   );
   const [status, setStatus] = useState("Ready");
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [showDebug, setShowDebug] = useState(false);
   const [showComposer, setShowComposer] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -229,6 +237,8 @@ function App() {
   const [accountEditForm, setAccountEditForm] = useState<ImapSettingsForm | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const messageRowRefs = useRef<Record<number, HTMLButtonElement | null>>({});
+  const loadSeqRef = useRef(0);
+  const snapshotCacheRef = useRef<Map<string, Snapshot>>(new Map());
   const openEmailLinkRef = useRef<(rawUrl: string) => void>(() => undefined);
   const leftAltDownRef = useRef(false);
   const composerBodyRef = useRef<HTMLDivElement | null>(null);
@@ -357,6 +367,7 @@ function App() {
       if (event.payload.startsWith("Sync complete")) {
         setSyncing(false);
         setStatus("Sync complete");
+        invalidateSnapshotCache();
         void load();
       }
       if (event.payload.startsWith("Sync failed")) {
@@ -369,6 +380,7 @@ function App() {
     void listen<MailboxChanged>("mailwind-mailbox-changed", (event) => {
       const count = event.payload.new_messages;
       setStatus(count ? `${count} new email${count === 1 ? "" : "s"}` : "Mailbox updated");
+      invalidateSnapshotCache();
       void load();
       if (count > 0) {
         void notifyNewMail(event.payload);
@@ -430,28 +442,63 @@ function App() {
     syncComposerBody();
   }
 
-  async function load(nextQuery = query, pageOverride = page) {
+  function currentMailboxCacheKey(nextQuery = query, pageOverride = page) {
+    return mailboxCacheKey({
+      folder,
+      accountId,
+      query: nextQuery,
+      readFilter,
+      page: pageOverride,
+      pageSize,
+    });
+  }
+
+  function invalidateSnapshotCache() {
+    snapshotCacheRef.current.clear();
+  }
+
+  async function load(nextQuery = query, pageOverride = page): Promise<boolean> {
+    const requestId = loadSeqRef.current + 1;
+    loadSeqRef.current = requestId;
+    const cacheKey = currentMailboxCacheKey(nextQuery, pageOverride);
+    const cached = snapshotCacheRef.current.get(cacheKey);
+    if (cached) {
+      setSnapshot(cached);
+    }
     pushDebug(
       `load mailbox folder=${folder} account=${accountId ?? "unified"} page=${pageOverride + 1} query=${nextQuery.trim() || "-"}`,
     );
-    const data = await invoke<Snapshot>("mailbox_snapshot", {
-      filter: {
-        folder,
-        account_id: accountId,
-        query: nextQuery.trim() || null,
-        read_filter: readFilter,
-        page: pageOverride,
-        page_size: pageSize,
-      },
-    });
-    setSnapshot(data);
-    const freshSelected = data.messages.find((message) => message.id === selectedId);
-    if (freshSelected) {
-      setSelectedMessage(freshSelected);
-      void loadThreadMessages(freshSelected.id);
-    } else if (selectedId && !selectedMessage) {
-      setSelectedId(null);
-      setThreadMessages([]);
+    try {
+      const data = await invoke<Snapshot>("mailbox_snapshot", {
+        filter: {
+          folder,
+          account_id: accountId,
+          query: nextQuery.trim() || null,
+          read_filter: readFilter,
+          page: pageOverride,
+          page_size: pageSize,
+        },
+      });
+      if (loadSeqRef.current !== requestId) return false;
+      snapshotCacheRef.current.set(cacheKey, data);
+      setSnapshot(data);
+      setLoadError(null);
+      const freshSelected = data.messages.find((message) => message.id === selectedId);
+      if (freshSelected) {
+        setSelectedMessage(freshSelected);
+        void loadThreadMessages(freshSelected.id);
+      } else if (selectedId && !selectedMessage) {
+        setSelectedId(null);
+        setThreadMessages([]);
+      }
+      return true;
+    } catch (error) {
+      if (loadSeqRef.current !== requestId) return false;
+      const message = error instanceof Error ? error.message : String(error);
+      setLoadError(message);
+      setStatus(`Mailbox refresh failed: ${message}`);
+      pushDebug(`Mailbox load error: ${message}`);
+      return false;
     }
   }
 
@@ -479,6 +526,7 @@ function App() {
     pushDebug(label);
     try {
       const result = await action();
+      if (result === false) return null;
       setStatus("Done");
       pushDebug("Done");
       await load();
@@ -696,6 +744,9 @@ function App() {
         input: {
           account_id: account.id,
           to: composer.to,
+          cc: composer.cc || null,
+          bcc: composer.bcc || null,
+          reply_to: composer.reply_to || null,
           subject: composer.subject,
           body: htmlBody,
           body_mime: composer.body_mime,
@@ -706,6 +757,7 @@ function App() {
       setSelectedId(null);
       setSelectedMessage(null);
       setThreadMessages([]);
+      invalidateSnapshotCache();
       setFolder("Sent");
       setStatus("Sent");
       pushDebug("Sent");
@@ -723,6 +775,9 @@ function App() {
     setComposer({
       account_id: String(accountId ?? snapshot.accounts[0]?.id ?? ""),
       to: "",
+      cc: "",
+      bcc: "",
+      reply_to: "",
       subject: "",
       body: "",
       body_mime: "text/html",
@@ -741,6 +796,9 @@ function App() {
     setComposer({
       account_id: String(replyTarget.account_id),
       to: replyAddress(replyTarget),
+      cc: "",
+      bcc: "",
+      reply_to: "",
       subject: replySubject(replyTarget.subject),
       body: "",
       body_mime: "text/html",
@@ -748,6 +806,55 @@ function App() {
     });
     setShowComposer(true);
     window.setTimeout(() => composerBodyRef.current?.focus(), 0);
+  }
+
+  function openReplyAll() {
+    const replyTarget = latestThreadMessage(threadMessages, selected);
+    if (!replyTarget) {
+      openCompose();
+      return;
+    }
+    const account = snapshot.accounts.find((item) => item.id === replyTarget.account_id);
+    const recipients = replyAllRecipients(replyTarget, account?.email ?? replyTarget.account_email);
+    setComposer({
+      account_id: String(replyTarget.account_id),
+      to: recipients.to,
+      cc: recipients.cc,
+      bcc: "",
+      reply_to: "",
+      subject: replySubject(replyTarget.subject),
+      body: "",
+      body_mime: "text/html",
+      reply_to_message_id: replyTarget.id,
+    });
+    setShowComposer(true);
+    window.setTimeout(() => composerBodyRef.current?.focus(), 0);
+  }
+
+  function openForward() {
+    const forwardTarget = latestThreadMessage(threadMessages, selected);
+    if (!forwardTarget) {
+      openCompose();
+      return;
+    }
+    const accountIdForForward = accountId ?? forwardTarget.account_id ?? snapshot.accounts[0]?.id ?? "";
+    const quotedBody = forwardBody(forwardTarget);
+    setComposer({
+      account_id: String(accountIdForForward),
+      to: "",
+      cc: "",
+      bcc: "",
+      reply_to: "",
+      subject: forwardSubject(forwardTarget.subject),
+      body: quotedBody,
+      body_mime: "text/html",
+      reply_to_message_id: null,
+    });
+    setShowComposer(true);
+    window.setTimeout(() => {
+      if (composerBodyRef.current) composerBodyRef.current.innerHTML = quotedBody;
+      composerBodyRef.current?.focus();
+    }, 0);
   }
 
   async function toggleNotifications(enabled: boolean) {
@@ -816,6 +923,7 @@ function App() {
     try {
       await invoke<void>("archive_message", { input: { message_id: selected.id } });
       clearCurrentMessage();
+      invalidateSnapshotCache();
       setStatus("Archived");
       pushDebug("Archived");
       await load();
@@ -840,6 +948,7 @@ function App() {
     try {
       await invoke<void>("delete_message", { input: { message_id: selected.id } });
       clearCurrentMessage();
+      invalidateSnapshotCache();
       setStatus(permanent ? "Deleted" : "Moved to Trash");
       pushDebug(permanent ? "Deleted" : "Moved to Trash");
       await load();
@@ -895,6 +1004,7 @@ function App() {
       await invoke<void>("remove_account", { input: { account_id: account.id } });
       if (accountId === account.id) setAccountId(null);
       clearCurrentMessage();
+      invalidateSnapshotCache();
     });
   }
 
@@ -928,6 +1038,7 @@ function App() {
       setComposer(emptyComposer);
       setEditingAccountId(null);
       setAccountEditForm(null);
+      invalidateSnapshotCache();
       setStatus("Database reset");
       pushDebug("Database reset");
     } catch (error) {
@@ -1353,6 +1464,13 @@ function App() {
           ))}
         </div>
 
+        {loadError ? (
+          <div className="mailbox-error" role="status">
+            <span>Mailbox refresh failed. Keeping the last loaded messages visible.</span>
+            <button onClick={() => void load()} type="button">Retry</button>
+          </div>
+        ) : null}
+
         <div
           aria-label="Email list"
           aria-activedescendant={selected ? `message-row-${selected.id}` : undefined}
@@ -1458,6 +1576,12 @@ function App() {
                   <button className="reply-action" onClick={openReply} title="Reply">
                     <PenLine size={18} />
                   </button>
+                  <button className="reply-action" onClick={openReplyAll} title="Reply all">
+                    <ReplyAll size={18} />
+                  </button>
+                  <button className="reply-action" onClick={openForward} title="Forward">
+                    <Send size={18} />
+                  </button>
                 </div>
               </div>
             </div>
@@ -1561,6 +1685,21 @@ function App() {
                 onChange={(event) => setComposer({ ...composer, to: event.currentTarget.value })}
                 placeholder="To"
                 required
+              />
+              <input
+                value={composer.cc}
+                onChange={(event) => setComposer({ ...composer, cc: event.currentTarget.value })}
+                placeholder="Cc"
+              />
+              <input
+                value={composer.bcc}
+                onChange={(event) => setComposer({ ...composer, bcc: event.currentTarget.value })}
+                placeholder="Bcc"
+              />
+              <input
+                value={composer.reply_to}
+                onChange={(event) => setComposer({ ...composer, reply_to: event.currentTarget.value })}
+                placeholder="Reply-To"
               />
               <input
                 value={composer.subject}
@@ -1765,6 +1904,85 @@ function latestThreadMessage(messages: MailMessage[], fallback: MailMessage | nu
   return messages.reduce((latest, message) =>
     message.date_ts >= latest.date_ts ? message : latest,
   );
+}
+
+function mailboxCacheKey(input: {
+  folder: string;
+  accountId: number | null;
+  query: string;
+  readFilter: ReadFilter;
+  page: number;
+  pageSize: number;
+}) {
+  return [
+    input.folder,
+    input.accountId ?? "unified",
+    input.query.trim(),
+    input.readFilter,
+    input.page,
+    input.pageSize,
+  ].join("\u001f");
+}
+
+function replyAllRecipients(message: MailMessage, ownEmail: string) {
+  const own = emailIdentity(ownEmail);
+  const to = uniqueAddresses([
+    replyAddress(message),
+    ...addressList(message.to_addr),
+  ]).filter((address) => emailIdentity(address) !== own);
+  const cc = uniqueAddresses(addressList(message.cc_addr))
+    .filter((address) => emailIdentity(address) !== own)
+    .filter((address) => !to.some((toAddress) => emailIdentity(toAddress) === emailIdentity(address)));
+  return {
+    to: to.join(", "),
+    cc: cc.join(", "),
+  };
+}
+
+function uniqueAddresses(addresses: string[]) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const address of addresses) {
+    const clean = address.trim();
+    const identity = emailIdentity(clean);
+    if (!identity || seen.has(identity)) continue;
+    seen.add(identity);
+    result.push(clean);
+  }
+  return result;
+}
+
+function addressList(value: string) {
+  return value
+    .split(/[,;]/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => extractEmailAddress(part) || part);
+}
+
+function emailIdentity(value: string) {
+  return (extractEmailAddress(value) || value).trim().toLowerCase();
+}
+
+function forwardSubject(subject: string) {
+  return /^fwd?:/i.test(subject.trim()) ? subject : `Fwd: ${subject || "(no subject)"}`;
+}
+
+function forwardBody(message: MailMessage) {
+  const body = isHtmlMessage(message)
+    ? sanitizeComposerHtml(message.body)
+    : plainTextToHtml(message.body || message.snippet);
+  return [
+    "<p><br></p>",
+    "<blockquote>",
+    `<p><strong>Forwarded message</strong></p>`,
+    `<p>From: ${escapeHtml(message.from_addr || message.account_email)}<br>`,
+    `Date: ${escapeHtml(formatFullDate(message.date_ts))}<br>`,
+    `Subject: ${escapeHtml(message.subject || "(no subject)")}<br>`,
+    `To: ${escapeHtml(message.to_addr || "")}</p>`,
+    body,
+    "</blockquote>",
+  ].join("");
 }
 
 function resizeEmailFrame(frame: HTMLIFrameElement) {

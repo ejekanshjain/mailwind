@@ -4,9 +4,10 @@ use keyring::v1::{Entry, Error as KeyringError};
 use lettre::{
     message::{Mailbox, MultiPart},
     transport::smtp::authentication::Credentials,
-    Message as SmtpMessage, SmtpTransport, Transport,
+    Address, Message as SmtpMessage, SmtpTransport, Transport,
 };
 use mailparse::DispositionType;
+use mailparse::MailAddr;
 use mailparse::MailHeaderMap;
 use reqwest::blocking::Client;
 use rusqlite::{params, types::Value as SqlValue, Connection, OptionalExtension};
@@ -17,12 +18,13 @@ use std::{
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager, State};
+use url::form_urlencoded;
 use uuid::Uuid;
 
 type AppResult<T> = Result<T, String>;
@@ -175,6 +177,9 @@ struct MessageFilter {
 struct SendInput {
     account_id: i64,
     to: String,
+    cc: Option<String>,
+    bcc: Option<String>,
+    reply_to: Option<String>,
     subject: String,
     body: String,
     body_mime: String,
@@ -263,6 +268,19 @@ struct NewAttachment {
     mime_type: String,
     size: i64,
     data: Option<Vec<u8>>,
+}
+
+struct OAuthCallback {
+    code: String,
+    state: String,
+}
+
+struct ImapRawFetch<'a> {
+    role: &'a str,
+    folder: &'a str,
+    uid: u32,
+    raw: &'a [u8],
+    is_read: bool,
 }
 
 fn now_ts() -> i64 {
@@ -387,7 +405,7 @@ fn init_db(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Err
 }
 
 fn boxed_app_error(error: String) -> Box<dyn std::error::Error> {
-    Box::new(std::io::Error::new(std::io::ErrorKind::Other, error))
+    Box::new(std::io::Error::other(error))
 }
 
 fn initialize_schema(conn: &Connection) -> AppResult<()> {
@@ -505,11 +523,46 @@ fn initialize_schema(conn: &Connection) -> AppResult<()> {
         ",
     )
     .map_err(|e| e.to_string())?;
-    ensure_message_metadata_columns(&conn)?;
-    backfill_message_metadata(&conn)?;
+    dedupe_accounts_for_unique_index(conn)?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_provider_email_unique ON accounts(provider, email)",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    ensure_message_metadata_columns(conn)?;
+    backfill_message_metadata(conn)?;
     conn.execute_batch("PRAGMA optimize;")
         .map_err(|e| e.to_string())?;
 
+    Ok(())
+}
+
+fn dedupe_accounts_for_unique_index(conn: &Connection) -> AppResult<()> {
+    let duplicate_ids = {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT id
+                FROM accounts
+                WHERE id NOT IN (
+                    SELECT MAX(id)
+                    FROM accounts
+                    GROUP BY provider, email
+                )
+                ",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    for account_id in duplicate_ids {
+        delete_account_secrets(account_id)?;
+        conn.execute("DELETE FROM accounts WHERE id = ?", params![account_id])
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -1695,8 +1748,7 @@ fn list_attachments_for_messages(
     if message_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let placeholders = std::iter::repeat("?")
-        .take(message_ids.len())
+    let placeholders = std::iter::repeat_n("?", message_ids.len())
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
@@ -1738,6 +1790,20 @@ fn required_input(value: &str, label: &str) -> AppResult<String> {
     }
 }
 
+fn normalize_email_input(value: &str, label: &str) -> AppResult<String> {
+    Ok(required_input(value, label)?.to_ascii_lowercase())
+}
+
+fn existing_account_id(conn: &Connection, provider: &str, email: &str) -> AppResult<Option<i64>> {
+    conn.query_row(
+        "SELECT id FROM accounts WHERE provider = ? AND email = ?",
+        rusqlite::params_from_iter([provider, email]),
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
 fn validate_port(value: i64, label: &str) -> AppResult<u16> {
     if (1..=65535).contains(&value) {
         Ok(value as u16)
@@ -1766,7 +1832,7 @@ fn connect_imap(
     state: State<'_, AppState>,
     input: ImapConnectInput,
 ) -> AppResult<AccountSummary> {
-    let email = required_input(&input.email, "Email")?;
+    let email = normalize_email_input(&input.email, "Email")?;
     let imap_host = required_input(&input.imap_host, "IMAP host")?;
     let smtp_host = required_input(&input.smtp_host, "SMTP host")?;
     let username = required_input(&input.username, "Username")?;
@@ -1811,32 +1877,57 @@ fn connect_imap(
 
     debug(&app, "Saving IMAP account to SQLite");
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "
-        INSERT INTO accounts (
-            provider, email, display_name, imap_host, imap_port, smtp_host, smtp_port,
-            username, password, created_at
+    let id = if let Some(id) = existing_account_id(&conn, "imap", &email)? {
+        store_account_secret(id, "password", &input.password)?;
+        conn.execute(
+            "
+            UPDATE accounts
+            SET display_name = ?, imap_host = ?, imap_port = ?,
+                smtp_host = ?, smtp_port = ?, username = ?, password = NULL
+            WHERE id = ? AND provider = 'imap'
+            ",
+            params![
+                display_name,
+                imap_host,
+                input.imap_port,
+                smtp_host,
+                input.smtp_port,
+                username,
+                id
+            ],
         )
-        VALUES ('imap', ?, ?, ?, ?, ?, ?, ?, NULL, ?)
-        ",
-        params![
-            email,
-            display_name,
-            imap_host,
-            input.imap_port,
-            smtp_host,
-            input.smtp_port,
-            username,
-            now_ts()
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    let id = conn.last_insert_rowid();
-    if let Err(error) = store_account_secret(id, "password", &input.password) {
-        let _ = conn.execute("DELETE FROM accounts WHERE id = ?", [id]);
-        return Err(error);
-    }
-    debug(&app, format!("IMAP account saved id={id}"));
+        .map_err(|e| e.to_string())?;
+        debug(&app, format!("IMAP account reconnected id={id}"));
+        id
+    } else {
+        conn.execute(
+            "
+            INSERT INTO accounts (
+                provider, email, display_name, imap_host, imap_port, smtp_host, smtp_port,
+                username, password, created_at
+            )
+            VALUES ('imap', ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+            ",
+            params![
+                email,
+                display_name,
+                imap_host,
+                input.imap_port,
+                smtp_host,
+                input.smtp_port,
+                username,
+                now_ts()
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        let id = conn.last_insert_rowid();
+        if let Err(error) = store_account_secret(id, "password", &input.password) {
+            let _ = conn.execute("DELETE FROM accounts WHERE id = ?", [id]);
+            return Err(error);
+        }
+        debug(&app, format!("IMAP account saved id={id}"));
+        id
+    };
     Ok(AccountSummary {
         id,
         provider: "imap".to_string(),
@@ -1923,21 +2014,41 @@ fn connect_gmail(
         .get("emailAddress")
         .and_then(Value::as_str)
         .unwrap_or("gmail-account")
-        .to_string();
+        .trim()
+        .to_ascii_lowercase();
 
     let conn = state.db.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "
-        INSERT INTO accounts (
-            provider, email, access_token, refresh_token, token_expires_at,
-            client_id, client_secret, created_at
+    let (id, created_account) = if let Some(id) = existing_account_id(&conn, "gmail", &email)? {
+        (
+            {
+                conn.execute(
+                    "
+                    UPDATE accounts
+                    SET token_expires_at = ?, access_token = NULL, refresh_token = NULL,
+                        client_id = NULL, client_secret = NULL
+                    WHERE id = ? AND provider = 'gmail'
+                    ",
+                    params![now_ts() + expires_in - 60, id],
+                )
+                .map_err(|e| e.to_string())?;
+                id
+            },
+            false,
         )
-        VALUES ('gmail', ?, NULL, NULL, ?, NULL, NULL, ?)
-        ",
-        params![email, now_ts() + expires_in - 60, now_ts()],
-    )
-    .map_err(|e| e.to_string())?;
-    let id = conn.last_insert_rowid();
+    } else {
+        conn.execute(
+            "
+            INSERT INTO accounts (
+                provider, email, access_token, refresh_token, token_expires_at,
+                client_id, client_secret, created_at
+            )
+            VALUES ('gmail', ?, NULL, NULL, ?, NULL, NULL, ?)
+            ",
+            params![email, now_ts() + expires_in - 60, now_ts()],
+        )
+        .map_err(|e| e.to_string())?;
+        (conn.last_insert_rowid(), true)
+    };
     for (field, value) in [
         ("access_token", access_token.as_str()),
         ("refresh_token", refresh_token.as_str()),
@@ -1946,7 +2057,9 @@ fn connect_gmail(
     ] {
         if let Err(error) = store_account_secret(id, field, value) {
             let _ = delete_account_secrets(id);
-            let _ = conn.execute("DELETE FROM accounts WHERE id = ?", [id]);
+            if created_account {
+                let _ = conn.execute("DELETE FROM accounts WHERE id = ?", [id]);
+            }
             return Err(error);
         }
     }
@@ -1976,21 +2089,21 @@ fn wait_for_oauth_callback(listener: TcpListener, expected_state: &str) -> AppRe
                     .split_whitespace()
                     .nth(1)
                     .ok_or_else(|| "Bad OAuth callback".to_string())?;
-                let code = query_param(path, "code")
-                    .ok_or_else(|| "OAuth callback missing code".to_string())?;
-                let state = query_param(path, "state")
-                    .ok_or_else(|| "OAuth callback missing state".to_string())?;
-                let body = b"<html><body><h2>Mailwind connected. You can close this tab.</h2></body></html>";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).ok();
-                stream.write_all(body).ok();
-                if state != expected_state {
+                let callback = parse_oauth_callback_path(path)?;
+                if callback.state != expected_state {
+                    write_oauth_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "Mailwind could not verify this OAuth request. Return to the app and try again.",
+                    );
                     return Err("OAuth state mismatch".to_string());
                 }
-                return Ok(code);
+                write_oauth_response(
+                    &mut stream,
+                    "200 OK",
+                    "Mailwind connected. You can close this tab.",
+                );
+                return Ok(callback.code);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
@@ -2001,20 +2114,30 @@ fn wait_for_oauth_callback(listener: TcpListener, expected_state: &str) -> AppRe
     Err("Timed out waiting for Google OAuth callback".to_string())
 }
 
+fn parse_oauth_callback_path(path: &str) -> AppResult<OAuthCallback> {
+    Ok(OAuthCallback {
+        code: query_param(path, "code").ok_or_else(|| "OAuth callback missing code".to_string())?,
+        state: query_param(path, "state")
+            .ok_or_else(|| "OAuth callback missing state".to_string())?,
+    })
+}
+
 fn query_param(path: &str, name: &str) -> Option<String> {
     let (_, query) = path.split_once('?')?;
-    for pair in query.split('&') {
-        let (key, value) = pair.split_once('=')?;
-        if key == name {
-            return Some(
-                value
-                    .replace("%2F", "/")
-                    .replace("%3A", ":")
-                    .replace("%20", " "),
-            );
-        }
-    }
-    None
+    let query = query.split('#').next().unwrap_or(query);
+    form_urlencoded::parse(query.as_bytes())
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
+fn write_oauth_response(stream: &mut TcpStream, status: &str, message: &str) {
+    let body = format!("<html><body><h2>{message}</h2></body></html>");
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    stream.write_all(body.as_bytes()).ok();
 }
 
 #[tauri::command]
@@ -3410,11 +3533,13 @@ fn store_imap_body_fetch(
         app,
         state,
         account,
-        role,
-        folder,
-        uid,
-        body,
-        fetch.flags().contains(&imap::types::Flag::Seen),
+        ImapRawFetch {
+            role,
+            folder,
+            uid,
+            raw: body,
+            is_read: fetch.flags().contains(&imap::types::Flag::Seen),
+        },
     )
 }
 
@@ -3438,11 +3563,13 @@ fn store_imap_header_text_fetch(
         app,
         state,
         account,
-        role,
-        folder,
-        uid,
-        &raw,
-        fetch.flags().contains(&imap::types::Flag::Seen),
+        ImapRawFetch {
+            role,
+            folder,
+            uid,
+            raw: &raw,
+            is_read: fetch.flags().contains(&imap::types::Flag::Seen),
+        },
     )
 }
 
@@ -3450,13 +3577,15 @@ fn store_imap_raw_message(
     app: Option<&tauri::AppHandle>,
     state: &State<'_, AppState>,
     account: &StoredAccount,
-    role: &str,
-    folder: &str,
-    uid: u32,
-    raw: &[u8],
-    is_read: bool,
+    fetch: ImapRawFetch<'_>,
 ) -> AppResult<bool> {
-    let message = match imap_to_message(role, folder, uid, raw, is_read) {
+    let message = match imap_to_message(
+        fetch.role,
+        fetch.folder,
+        fetch.uid,
+        fetch.raw,
+        fetch.is_read,
+    ) {
         Ok(message) => message,
         Err(error) => {
             if let Some(app) = app {
@@ -3464,7 +3593,7 @@ fn store_imap_raw_message(
                     app,
                     format!(
                         "IMAP skipped unparsable message email={} folder={} uid={} error={}",
-                        account.email, role, uid, error
+                        account.email, fetch.role, fetch.uid, error
                     ),
                 );
             }
@@ -3915,8 +4044,8 @@ fn run_send_message(app: &tauri::AppHandle, input: SendInput) -> AppResult<Store
         folder: "Sent".to_string(),
         subject: clean_header_value(&input.subject),
         from_addr: account.email.clone(),
-        to_addr: input.to,
-        cc_addr: String::new(),
+        to_addr: input.to.clone(),
+        cc_addr: input.cc.clone().unwrap_or_default(),
         date_ts: Utc::now().timestamp(),
         snippet: snippet_for_body(&input.body, &input.body_mime),
         body: input.body,
@@ -4003,12 +4132,36 @@ fn build_outbound_message(
         .email
         .parse::<Mailbox>()
         .map_err(|e| e.to_string())?;
-    let to = input.to.parse::<Mailbox>().map_err(|e| e.to_string())?;
+    let to_recipients = parse_mailbox_list(&input.to, "To")?;
+    if to_recipients.is_empty() {
+        return Err("To must include at least one recipient".to_string());
+    }
+    let cc_recipients = parse_optional_mailbox_list(input.cc.as_deref(), "Cc")?;
+    let bcc_recipients = parse_optional_mailbox_list(input.bcc.as_deref(), "Bcc")?;
     let mut builder = SmtpMessage::builder()
         .from(from)
-        .to(to)
         .subject(&input.subject)
         .message_id(Some(message_id.to_string()));
+    for recipient in to_recipients {
+        builder = builder.to(recipient);
+    }
+    for recipient in cc_recipients {
+        builder = builder.cc(recipient);
+    }
+    for recipient in bcc_recipients {
+        builder = builder.bcc(recipient);
+    }
+    if let Some(reply_to) = input
+        .reply_to
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        let mut reply_to_recipients = parse_mailbox_list(reply_to, "Reply-To")?;
+        if reply_to_recipients.len() != 1 {
+            return Err("Reply-To must contain exactly one mailbox".to_string());
+        }
+        builder = builder.reply_to(reply_to_recipients.remove(0));
+    }
     if let Some(message_id) = reply_context
         .and_then(|reply| nonempty(&reply.message_header_id))
         .map(ToString::to_string)
@@ -4030,6 +4183,39 @@ fn build_outbound_message(
     } else {
         builder.body(input.body.clone()).map_err(|e| e.to_string())
     }
+}
+
+fn parse_optional_mailbox_list(value: Option<&str>, label: &str) -> AppResult<Vec<Mailbox>> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => parse_mailbox_list(value, label),
+        std::option::Option::None => Ok(Vec::new()),
+    }
+}
+
+fn parse_mailbox_list(value: &str, label: &str) -> AppResult<Vec<Mailbox>> {
+    let parsed = mailparse::addrparse(value).map_err(|e| format!("{label} address error: {e}"))?;
+    let mut mailboxes = Vec::new();
+    for address in parsed.iter() {
+        collect_mailboxes(address, &mut mailboxes)
+            .map_err(|e| format!("{label} address error: {e}"))?;
+    }
+    Ok(mailboxes)
+}
+
+fn collect_mailboxes(address: &MailAddr, mailboxes: &mut Vec<Mailbox>) -> AppResult<()> {
+    match address {
+        MailAddr::Single(info) => {
+            let email = info.addr.parse::<Address>().map_err(|e| e.to_string())?;
+            mailboxes.push(Mailbox::new(info.display_name.clone(), email));
+        }
+        MailAddr::Group(group) => {
+            for info in &group.addrs {
+                let email = info.addr.parse::<Address>().map_err(|e| e.to_string())?;
+                mailboxes.push(Mailbox::new(info.display_name.clone(), email));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn send_smtp(account: &StoredAccount, outbound: &SmtpMessage) -> AppResult<()> {
@@ -4191,7 +4377,7 @@ fn run_delete_message(app: &tauri::AppHandle, input: DeleteInput) -> AppResult<(
 
     let permanent = folder == "Trash";
     debug(
-        &app,
+        app,
         format!(
             "Delete message id={} provider={} permanent={}",
             input.message_id, account.provider, permanent
@@ -4236,7 +4422,7 @@ fn run_delete_message(app: &tauri::AppHandle, input: DeleteInput) -> AppResult<(
         )
         .map_err(|e| e.to_string())?;
     }
-    debug(&app, "Delete complete");
+    debug(app, "Delete complete");
     Ok(())
 }
 
@@ -4863,7 +5049,7 @@ fn reset_database_inner(app: &tauri::AppHandle) -> AppResult<()> {
     Ok(())
 }
 
-fn sqlite_database_files(db_path: &PathBuf) -> Vec<PathBuf> {
+fn sqlite_database_files(db_path: &Path) -> Vec<PathBuf> {
     ["", "-wal", "-shm"]
         .iter()
         .map(|suffix| {
@@ -4880,7 +5066,7 @@ fn update_imap_settings(
     state: State<'_, AppState>,
     input: UpdateImapSettingsInput,
 ) -> AppResult<()> {
-    let email = required_input(&input.email, "Email")?;
+    let email = normalize_email_input(&input.email, "Email")?;
     let imap_host = required_input(&input.imap_host, "IMAP host")?;
     let smtp_host = required_input(&input.smtp_host, "SMTP host")?;
     let username = required_input(&input.username, "Username")?;
@@ -4909,6 +5095,15 @@ fn update_imap_settings(
         .to_string();
     if password.is_empty() {
         return Err("Password is required because no existing password is stored".to_string());
+    }
+    let duplicate_account_id = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        existing_account_id(&conn, "imap", &email)?
+    };
+    if let Some(existing_id) = duplicate_account_id {
+        if existing_id != input.account_id {
+            return Err(format!("An IMAP account for {email} already exists"));
+        }
     }
 
     debug(
