@@ -1,8 +1,10 @@
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Utc};
+use keyring::v1::{Entry, Error as KeyringError};
 use lettre::{
-    message::Mailbox, transport::smtp::authentication::Credentials, Message as SmtpMessage,
-    SmtpTransport, Transport,
+    message::{Mailbox, MultiPart},
+    transport::smtp::authentication::Credentials,
+    Message as SmtpMessage, SmtpTransport, Transport,
 };
 use mailparse::DispositionType;
 use mailparse::MailHeaderMap;
@@ -28,11 +30,20 @@ type ImapSession = imap::Session<native_tls::TlsStream<TcpStream>>;
 
 const IMAP_FLAG_FETCH_CHUNK: usize = 100;
 const IMAP_BODY_FETCH_CHUNK: usize = 25;
+const KEYRING_SERVICE: &str = "com.mailwind.desktop";
+const ACCOUNT_SECRET_FIELDS: [&str; 5] = [
+    "access_token",
+    "refresh_token",
+    "client_secret",
+    "password",
+    "client_id",
+];
 
 struct AppState {
     db: Mutex<Connection>,
     syncing: Mutex<bool>,
     polling: Mutex<bool>,
+    resetting: Mutex<bool>,
     idle_accounts: Mutex<HashSet<i64>>,
 }
 
@@ -166,6 +177,7 @@ struct SendInput {
     to: String,
     subject: String,
     body: String,
+    body_mime: String,
     reply_to_message_id: Option<i64>,
 }
 
@@ -215,6 +227,12 @@ struct MailboxChanged {
 #[derive(Debug, Serialize)]
 struct DownloadedAttachment {
     path: String,
+}
+
+#[derive(Debug, Clone)]
+struct ImapMovedLocation {
+    folder: String,
+    uid: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -361,7 +379,18 @@ fn init_db(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Err
     let dir = app.path().app_data_dir()?;
     fs::create_dir_all(&dir)?;
     let conn = Connection::open(dir.join("mailwind.sqlite3"))?;
+    initialize_schema(&conn).map_err(boxed_app_error)?;
+    migrate_plaintext_account_secrets(&conn).map_err(boxed_app_error)?;
+    recover_message_search_index(&conn).map_err(boxed_app_error)?;
 
+    Ok(conn)
+}
+
+fn boxed_app_error(error: String) -> Box<dyn std::error::Error> {
+    Box::new(std::io::Error::new(std::io::ErrorKind::Other, error))
+}
+
+fn initialize_schema(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(
         "
         PRAGMA foreign_keys = ON;
@@ -474,12 +503,14 @@ fn init_db(app: &tauri::AppHandle) -> Result<Connection, Box<dyn std::error::Err
         CREATE INDEX IF NOT EXISTS idx_attachments_message_id
             ON attachments(message_id);
         ",
-    )?;
+    )
+    .map_err(|e| e.to_string())?;
     ensure_message_metadata_columns(&conn)?;
     backfill_message_metadata(&conn)?;
-    conn.execute_batch("PRAGMA optimize;")?;
+    conn.execute_batch("PRAGMA optimize;")
+        .map_err(|e| e.to_string())?;
 
-    Ok(conn)
+    Ok(())
 }
 
 fn ensure_message_metadata_columns(conn: &Connection) -> AppResult<()> {
@@ -601,6 +632,175 @@ fn backfill_message_metadata(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+fn recover_message_search_index(conn: &Connection) -> AppResult<()> {
+    let missing_rows: i64 = conn
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM messages m
+            LEFT JOIN messages_fts f ON f.rowid = m.id
+            WHERE f.rowid IS NULL
+            ",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let orphaned_rows: i64 = conn
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM messages_fts f
+            LEFT JOIN messages m ON m.id = f.rowid
+            WHERE m.id IS NULL
+            ",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if missing_rows == 0 && orphaned_rows == 0 {
+        return Ok(());
+    }
+    conn.execute("DELETE FROM messages_fts", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "
+        INSERT INTO messages_fts(rowid, subject, from_addr, to_addr, body)
+        SELECT id, subject, from_addr, to_addr, body
+        FROM messages
+        ",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn migrate_plaintext_account_secrets(conn: &Connection) -> AppResult<()> {
+    let rows = {
+        let mut stmt = conn
+            .prepare(
+                "
+                SELECT id, access_token, refresh_token, client_secret, password, client_id
+                FROM accounts
+                WHERE COALESCE(access_token, '') <> ''
+                   OR COALESCE(refresh_token, '') <> ''
+                   OR COALESCE(client_secret, '') <> ''
+                   OR COALESCE(password, '') <> ''
+                   OR COALESCE(client_id, '') <> ''
+                ",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+
+    for (account_id, access_token, refresh_token, client_secret, password, client_id) in rows {
+        for (field, value) in [
+            ("access_token", access_token.as_deref()),
+            ("refresh_token", refresh_token.as_deref()),
+            ("client_secret", client_secret.as_deref()),
+            ("password", password.as_deref()),
+            ("client_id", client_id.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                store_account_secret(account_id, field, value)?;
+            }
+        }
+        conn.execute(
+            "
+            UPDATE accounts
+            SET access_token = NULL,
+                refresh_token = NULL,
+                client_secret = NULL,
+                password = NULL,
+                client_id = NULL
+            WHERE id = ?
+            ",
+            params![account_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn account_secret_entry(account_id: i64, field: &str) -> AppResult<Entry> {
+    Entry::new(KEYRING_SERVICE, &format!("account:{account_id}:{field}"))
+        .map_err(|e| format!("Could not open secure credential store for {field}: {e}"))
+}
+
+fn store_account_secret(account_id: i64, field: &str, value: &str) -> AppResult<()> {
+    account_secret_entry(account_id, field)?
+        .set_password(value)
+        .map_err(|e| format!("Could not store {field} in the OS credential store: {e}"))
+}
+
+fn load_account_secret(account_id: i64, field: &str) -> AppResult<Option<String>> {
+    match account_secret_entry(account_id, field)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(KeyringError::NoEntry) => Ok(None),
+        Err(error) => Err(format!(
+            "Could not read {field} from the OS credential store: {error}"
+        )),
+    }
+}
+
+fn delete_account_secret(account_id: i64, field: &str) -> AppResult<()> {
+    match account_secret_entry(account_id, field)?.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+        Err(error) => Err(format!(
+            "Could not delete {field} from the OS credential store: {error}"
+        )),
+    }
+}
+
+fn delete_account_secrets(account_id: i64) -> AppResult<()> {
+    for field in ACCOUNT_SECRET_FIELDS {
+        delete_account_secret(account_id, field)?;
+    }
+    Ok(())
+}
+
+fn delete_all_account_secrets(conn: &Connection) -> AppResult<()> {
+    let ids = {
+        let mut stmt = conn
+            .prepare("SELECT id FROM accounts")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+    };
+    for id in ids {
+        delete_account_secrets(id)?;
+    }
+    Ok(())
+}
+
+fn resolve_account_secrets(mut account: StoredAccount) -> AppResult<StoredAccount> {
+    account.access_token = load_account_secret(account.id, "access_token")?;
+    account.refresh_token = load_account_secret(account.id, "refresh_token")?;
+    account.client_id = load_account_secret(account.id, "client_id")?;
+    account.client_secret = load_account_secret(account.id, "client_secret")?;
+    account.password = load_account_secret(account.id, "password")?;
+    Ok(account)
+}
+
+fn resolve_accounts(accounts: Vec<StoredAccount>) -> AppResult<Vec<StoredAccount>> {
+    accounts.into_iter().map(resolve_account_secrets).collect()
+}
+
 fn backfilled_conversation_id(
     provider_message_id: &str,
     current_thread_id: &str,
@@ -644,22 +844,25 @@ fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAccount> {
 }
 
 fn get_account(conn: &Connection, id: i64) -> AppResult<StoredAccount> {
-    conn.query_row(
+    let account = conn
+        .query_row(
         "SELECT id, provider, email, display_name, access_token, refresh_token, token_expires_at,
                 client_id, client_secret, imap_host, imap_port, smtp_host, smtp_port, username, password
          FROM accounts WHERE id = ?",
         params![id],
         row_to_account,
-    )
-    .optional()
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| "Account not found".to_string())
+        )
+        .optional()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Account not found".to_string())?;
+    resolve_account_secrets(account)
 }
 
 fn upsert_message(conn: &Connection, account_id: i64, msg: &NewMessage) -> AppResult<()> {
-    delete_matching_local_sent_copy(conn, account_id, msg)?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    delete_matching_local_sent_copy(&tx, account_id, msg)?;
     let ts = now_ts();
-    conn.execute(
+    tx.execute(
         "
         INSERT INTO messages (
             account_id, provider_message_id, thread_id, message_header_id, in_reply_to,
@@ -709,7 +912,7 @@ fn upsert_message(conn: &Connection, account_id: i64, msg: &NewMessage) -> AppRe
     )
     .map_err(|e| e.to_string())?;
 
-    let id: i64 = conn
+    let id: i64 = tx
         .query_row(
             "SELECT id FROM messages WHERE account_id = ? AND provider_message_id = ?",
             params![account_id, msg.provider_message_id],
@@ -717,17 +920,17 @@ fn upsert_message(conn: &Connection, account_id: i64, msg: &NewMessage) -> AppRe
         )
         .map_err(|e| e.to_string())?;
 
-    conn.execute("DELETE FROM messages_fts WHERE rowid = ?", params![id])
+    tx.execute("DELETE FROM messages_fts WHERE rowid = ?", params![id])
         .map_err(|e| e.to_string())?;
-    conn.execute(
+    tx.execute(
         "INSERT INTO messages_fts(rowid, subject, from_addr, to_addr, body) VALUES (?, ?, ?, ?, ?)",
         params![id, msg.subject, msg.from_addr, msg.to_addr, msg.body],
     )
     .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM attachments WHERE message_id = ?", params![id])
+    tx.execute("DELETE FROM attachments WHERE message_id = ?", params![id])
         .map_err(|e| e.to_string())?;
     for attachment in &msg.attachments {
-        conn.execute(
+        tx.execute(
             "
             INSERT INTO attachments (
                 message_id, provider_attachment_id, filename, mime_type, size, data, created_at
@@ -746,6 +949,7 @@ fn upsert_message(conn: &Connection, account_id: i64, msg: &NewMessage) -> AppRe
         )
         .map_err(|e| e.to_string())?;
     }
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -779,12 +983,19 @@ fn delete_matching_local_sent_copy(
     drop(stmt);
 
     for id in ids {
-        delete_message_row(conn, id)?;
+        delete_message_row_inner(conn, id)?;
     }
     Ok(())
 }
 
 fn delete_message_row(conn: &Connection, id: i64) -> AppResult<()> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    delete_message_row_inner(&tx, id)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn delete_message_row_inner(conn: &Connection, id: i64) -> AppResult<()> {
     conn.execute("DELETE FROM messages_fts WHERE rowid = ?", params![id])
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM messages WHERE id = ?", params![id])
@@ -1365,12 +1576,77 @@ fn count_messages(state: State<'_, AppState>, filter: &MessageFilter) -> AppResu
 }
 
 fn fts_query_value(query: &str) -> Option<String> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(format!("\"{}\"", trimmed.replace('"', "\"\"")))
+    let terms = parse_search_terms(query);
+    if terms.is_empty() {
+        return None;
     }
+    Some(
+        terms
+            .into_iter()
+            .map(|term| match term {
+                SearchTerm::Word(value) => format!("{}*", fts_escape_word(&value)),
+                SearchTerm::Phrase(value) => format!("\"{}\"", value.replace('"', "\"\"")),
+            })
+            .collect::<Vec<_>>()
+            .join(" AND "),
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SearchTerm {
+    Word(String),
+    Phrase(String),
+}
+
+fn parse_search_terms(query: &str) -> Vec<SearchTerm> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut phrase = String::new();
+    let mut in_phrase = false;
+
+    for ch in query.chars() {
+        if ch == '"' {
+            if in_phrase {
+                let value = collapse_spaces(&phrase);
+                if !value.is_empty() {
+                    terms.push(SearchTerm::Phrase(value));
+                }
+                phrase.clear();
+                in_phrase = false;
+            } else {
+                push_search_word(&mut terms, &mut current);
+                in_phrase = true;
+            }
+            continue;
+        }
+        if in_phrase {
+            phrase.push(ch);
+        } else if ch.is_alphanumeric() || ch == '_' {
+            current.push(ch);
+        } else {
+            push_search_word(&mut terms, &mut current);
+        }
+    }
+    if in_phrase {
+        current.push_str(&phrase);
+    }
+    push_search_word(&mut terms, &mut current);
+    terms
+}
+
+fn push_search_word(terms: &mut Vec<SearchTerm>, current: &mut String) {
+    let value = current.trim().to_string();
+    current.clear();
+    if !value.is_empty() {
+        terms.push(SearchTerm::Word(value));
+    }
+}
+
+fn fts_escape_word(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || *ch == '_')
+        .collect::<String>()
 }
 
 fn message_where_clause(
@@ -1453,22 +1729,63 @@ fn list_attachments_for_messages(
     Ok(attachments)
 }
 
+fn required_input(value: &str, label: &str) -> AppResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(format!("{label} is required"))
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
+fn validate_port(value: i64, label: &str) -> AppResult<u16> {
+    if (1..=65535).contains(&value) {
+        Ok(value as u16)
+    } else {
+        Err(format!("{label} must be between 1 and 65535"))
+    }
+}
+
+fn validate_smtp_login(host: &str, port: u16, username: &str, password: &str) -> AppResult<()> {
+    let mailer = SmtpTransport::relay(host)
+        .map_err(|e| format!("SMTP setup failed for {host}:{port}: {e}"))?
+        .port(port)
+        .timeout(Some(Duration::from_secs(30)))
+        .credentials(Credentials::new(username.to_string(), password.to_string()))
+        .build();
+    match mailer.test_connection() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("SMTP server did not accept the connection".to_string()),
+        Err(error) => Err(format!("SMTP login failed for {host}:{port}: {error}")),
+    }
+}
+
 #[tauri::command]
 fn connect_imap(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     input: ImapConnectInput,
 ) -> AppResult<AccountSummary> {
+    let email = required_input(&input.email, "Email")?;
+    let imap_host = required_input(&input.imap_host, "IMAP host")?;
+    let smtp_host = required_input(&input.smtp_host, "SMTP host")?;
+    let username = required_input(&input.username, "Username")?;
+    if input.password.is_empty() {
+        return Err("Password is required".to_string());
+    }
+    let imap_port = validate_port(input.imap_port, "IMAP port")?;
+    let smtp_port = validate_port(input.smtp_port, "SMTP port")?;
+    let display_name = input
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     debug(
         &app,
         format!(
             "IMAP connect start email={} imap={}:{} smtp={}:{} username={}",
-            input.email,
-            input.imap_host,
-            input.imap_port,
-            input.smtp_host,
-            input.smtp_port,
-            input.username
+            email, imap_host, imap_port, smtp_host, smtp_port, username
         ),
     );
     debug(&app, "IMAP building TLS connector");
@@ -1476,12 +1793,12 @@ fn connect_imap(
         .build()
         .map_err(|e| e.to_string())?;
     debug(&app, "IMAP opening TCP/TLS connection with 15s timeout");
-    let client = connect_imap_client(input.imap_host.as_str(), input.imap_port as u16, &tls)?;
+    let client = connect_imap_client(imap_host.as_str(), imap_port, &tls)?;
     debug(
         &app,
         "IMAP TCP/TLS ready, attempting login with 15s socket timeout",
     );
-    let mut session = client.login(input.username.as_str(), input.password.as_str()).map_err(|e| {
+    let mut session = client.login(username.as_str(), input.password.as_str()).map_err(|e| {
         format!(
             "IMAP login failed or timed out after 15s. Check that IMAP is enabled and the password is valid for IMAP/app-password login. Server error: {}",
             e.0
@@ -1489,6 +1806,8 @@ fn connect_imap(
     })?;
     debug(&app, "IMAP login succeeded");
     session.logout().ok();
+    debug(&app, "Testing SMTP login");
+    validate_smtp_login(&smtp_host, smtp_port, &username, &input.password)?;
 
     debug(&app, "Saving IMAP account to SQLite");
     let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -1498,33 +1817,36 @@ fn connect_imap(
             provider, email, display_name, imap_host, imap_port, smtp_host, smtp_port,
             username, password, created_at
         )
-        VALUES ('imap', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES ('imap', ?, ?, ?, ?, ?, ?, ?, NULL, ?)
         ",
         params![
-            input.email,
-            input.display_name,
-            input.imap_host,
+            email,
+            display_name,
+            imap_host,
             input.imap_port,
-            input.smtp_host,
+            smtp_host,
             input.smtp_port,
-            input.username,
-            input.password,
+            username,
             now_ts()
         ],
     )
     .map_err(|e| e.to_string())?;
     let id = conn.last_insert_rowid();
+    if let Err(error) = store_account_secret(id, "password", &input.password) {
+        let _ = conn.execute("DELETE FROM accounts WHERE id = ?", [id]);
+        return Err(error);
+    }
     debug(&app, format!("IMAP account saved id={id}"));
     Ok(AccountSummary {
         id,
         provider: "imap".to_string(),
-        email: input.email,
-        display_name: input.display_name,
-        imap_host: Some(input.imap_host),
+        email,
+        display_name,
+        imap_host: Some(imap_host),
         imap_port: Some(input.imap_port),
-        smtp_host: Some(input.smtp_host),
+        smtp_host: Some(smtp_host),
         smtp_port: Some(input.smtp_port),
-        username: Some(input.username),
+        username: Some(username),
     })
 }
 
@@ -1533,6 +1855,8 @@ fn connect_gmail(
     state: State<'_, AppState>,
     input: GmailConnectInput,
 ) -> AppResult<AccountSummary> {
+    let client_id = required_input(&input.client_id, "Google OAuth client ID")?;
+    let client_secret = required_input(&input.client_secret, "Google OAuth client secret")?;
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -1542,7 +1866,7 @@ fn connect_gmail(
         "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send";
     let auth_url = format!(
         "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
-        urlencoding::encode(&input.client_id),
+        urlencoding::encode(&client_id),
         urlencoding::encode(&redirect_uri),
         urlencoding::encode(scope),
         urlencoding::encode(&oauth_state),
@@ -1556,8 +1880,8 @@ fn connect_gmail(
         .post("https://oauth2.googleapis.com/token")
         .form(&[
             ("code", callback.as_str()),
-            ("client_id", input.client_id.as_str()),
-            ("client_secret", input.client_secret.as_str()),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
             ("redirect_uri", redirect_uri.as_str()),
             ("grant_type", "authorization_code"),
         ])
@@ -1608,20 +1932,24 @@ fn connect_gmail(
             provider, email, access_token, refresh_token, token_expires_at,
             client_id, client_secret, created_at
         )
-        VALUES ('gmail', ?, ?, ?, ?, ?, ?, ?)
+        VALUES ('gmail', ?, NULL, NULL, ?, NULL, NULL, ?)
         ",
-        params![
-            email,
-            access_token,
-            refresh_token,
-            now_ts() + expires_in - 60,
-            input.client_id,
-            input.client_secret,
-            now_ts()
-        ],
+        params![email, now_ts() + expires_in - 60, now_ts()],
     )
     .map_err(|e| e.to_string())?;
     let id = conn.last_insert_rowid();
+    for (field, value) in [
+        ("access_token", access_token.as_str()),
+        ("refresh_token", refresh_token.as_str()),
+        ("client_id", client_id.as_str()),
+        ("client_secret", client_secret.as_str()),
+    ] {
+        if let Err(error) = store_account_secret(id, field, value) {
+            let _ = delete_account_secrets(id);
+            let _ = conn.execute("DELETE FROM accounts WHERE id = ?", [id]);
+            return Err(error);
+        }
+    }
 
     Ok(AccountSummary {
         id,
@@ -1702,6 +2030,11 @@ fn sync_account(app: tauri::AppHandle, account_id: i64) -> AppResult<()> {
 fn start_sync_job(app: tauri::AppHandle, account_id: Option<i64>) -> AppResult<()> {
     {
         let state = app.state::<AppState>();
+        let resetting = state.resetting.lock().map_err(|e| e.to_string())?;
+        if *resetting {
+            return Err("Cannot sync while reset is running".to_string());
+        }
+        drop(resetting);
         let mut syncing = state.syncing.lock().map_err(|e| e.to_string())?;
         if *syncing {
             return Err("Sync already running".to_string());
@@ -1732,21 +2065,6 @@ fn start_sync_job(app: tauri::AppHandle, account_id: Option<i64>) -> AppResult<(
     Ok(())
 }
 
-fn start_mail_action_job<F>(app: tauri::AppHandle, label: &'static str, job: F) -> AppResult<()>
-where
-    F: FnOnce(&tauri::AppHandle) -> AppResult<()> + Send + 'static,
-{
-    debug(&app, format!("{label} queued in background"));
-    thread::spawn(move || {
-        debug(&app, format!("{label} started"));
-        match job(&app) {
-            Ok(()) => debug(&app, format!("Mail action complete: {label}")),
-            Err(error) => debug(&app, format!("Mail action failed: {label}: {error}")),
-        }
-    });
-    Ok(())
-}
-
 fn run_sync_job(app: &tauri::AppHandle, account_id: Option<i64>) -> AppResult<()> {
     let state = app.state::<AppState>();
     let accounts = {
@@ -1764,8 +2082,10 @@ fn run_sync_job(app: &tauri::AppHandle, account_id: Option<i64>) -> AppResult<()
             let rows = stmt
                 .query_map([], row_to_account)
                 .map_err(|e| e.to_string())?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| e.to_string())?
+            resolve_accounts(
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| e.to_string())?,
+            )?
         }
     };
 
@@ -1885,6 +2205,16 @@ fn sync_worker_count(account_count: usize, force_serial: bool) -> usize {
     account_count.min(cpu_based).max(1)
 }
 
+fn ensure_not_resetting(app: &tauri::AppHandle) -> AppResult<()> {
+    let state = app.state::<AppState>();
+    let resetting = state.resetting.lock().map_err(|e| e.to_string())?;
+    if *resetting {
+        Err("Database reset is running".to_string())
+    } else {
+        Ok(())
+    }
+}
+
 fn start_mail_polling(app: tauri::AppHandle) {
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(8));
@@ -1925,8 +2255,10 @@ fn spawn_missing_idle_watchers(app: &tauri::AppHandle) -> AppResult<()> {
         let rows = stmt
             .query_map([], row_to_account)
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+        resolve_accounts(
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?,
+        )?
     };
 
     for account in accounts {
@@ -2022,6 +2354,7 @@ fn idle_account_current(app: &tauri::AppHandle, account: &StoredAccount) -> AppR
     else {
         return Ok(false);
     };
+    let current = resolve_account_secrets(current)?;
     Ok(current.provider == account.provider
         && current.email == account.email
         && current.imap_host == account.imap_host
@@ -2040,6 +2373,12 @@ fn clear_idle_account(app: &tauri::AppHandle, account_id: i64) {
 
 fn run_poll_tick(app: &tauri::AppHandle) -> AppResult<()> {
     let state = app.state::<AppState>();
+    {
+        let resetting = state.resetting.lock().map_err(|e| e.to_string())?;
+        if *resetting {
+            return Ok(());
+        }
+    }
     {
         let syncing = state.syncing.lock().map_err(|e| e.to_string())?;
         if *syncing {
@@ -2076,8 +2415,10 @@ fn run_poll_job(app: &tauri::AppHandle) -> AppResult<()> {
         let rows = stmt
             .query_map([], row_to_account)
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
+        resolve_accounts(
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?,
+        )?
     };
 
     let mut new_messages = 0;
@@ -2432,10 +2773,11 @@ fn gmail_access_token(state: &State<'_, AppState>, account: &StoredAccount) -> A
         .and_then(Value::as_i64)
         .unwrap_or(3600);
 
+    store_account_secret(account.id, "access_token", &access_token)?;
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "UPDATE accounts SET access_token = ?, token_expires_at = ? WHERE id = ?",
-        params![access_token, now_ts() + expires_in - 60, account.id],
+        "UPDATE accounts SET access_token = NULL, token_expires_at = ? WHERE id = ?",
+        params![now_ts() + expires_in - 60, account.id],
     )
     .map_err(|e| e.to_string())?;
     Ok(access_token)
@@ -2451,14 +2793,20 @@ fn sync_gmail_messages(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| e.to_string())?;
-    let labels = [("Inbox", "INBOX"), ("Sent", "SENT"), ("Trash", "TRASH")];
+    let labels = [
+        ("Inbox", Some("INBOX"), None),
+        ("Sent", Some("SENT"), None),
+        ("Trash", Some("TRASH"), None),
+        ("Archive", None, Some("-in:inbox -in:sent -in:trash")),
+    ];
     let mut count = 0;
     let page_size = 100;
 
-    for (folder, label) in labels {
+    for (folder, label, query) in labels {
         let mut page_token: Option<String> = None;
         let mut folder_count = 0;
-        let mut skipped_existing = 0;
+        let mut refreshed_existing = 0;
+        let mut new_count = 0;
         let mut upstream_ids = HashSet::new();
         let existing_ids = {
             let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -2467,8 +2815,16 @@ fn sync_gmail_messages(
 
         loop {
             let mut list_url = format!(
-                "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={page_size}&labelIds={label}"
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={page_size}"
             );
+            if let Some(label) = label {
+                list_url.push_str("&labelIds=");
+                list_url.push_str(&urlencoding::encode(label));
+            }
+            if let Some(query) = query {
+                list_url.push_str("&q=");
+                list_url.push_str(&urlencoding::encode(query));
+            }
             if let Some(token) = page_token.as_deref() {
                 list_url.push_str("&pageToken=");
                 list_url.push_str(&urlencoding::encode(token));
@@ -2496,16 +2852,6 @@ fn sync_gmail_messages(
                     continue;
                 };
                 upstream_ids.insert(id.to_string());
-                if existing_ids.contains(id) {
-                    let conn = state.db.lock().map_err(|e| e.to_string())?;
-                    conn.execute(
-                        "UPDATE messages SET folder = ?, updated_at = ? WHERE account_id = ? AND provider_message_id = ?",
-                        params![folder, now_ts(), account.id, id],
-                    )
-                    .map_err(|e| e.to_string())?;
-                    skipped_existing += 1;
-                    continue;
-                }
                 let url = format!(
                     "https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full"
                 );
@@ -2521,6 +2867,11 @@ fn sync_gmail_messages(
                 let message = gmail_to_message(folder, &raw);
                 let conn = state.db.lock().map_err(|e| e.to_string())?;
                 upsert_message(&conn, account.id, &message)?;
+                if existing_ids.contains(id) {
+                    refreshed_existing += 1;
+                } else {
+                    new_count += 1;
+                }
                 count += 1;
                 folder_count += 1;
                 if folder_count % 100 == 0 {
@@ -2552,7 +2903,7 @@ fn sync_gmail_messages(
             debug(
                 app,
                 format!(
-                    "Gmail sync folder complete email={} folder={} new={folder_count} existing={skipped_existing} removed={removed}",
+                    "Gmail sync folder complete email={} folder={} written={folder_count} new={new_count} refreshed={refreshed_existing} removed={removed}",
                     account.email, folder
                 ),
             );
@@ -2744,6 +3095,7 @@ fn sync_imap_messages(
         ("Inbox", vec!["INBOX"]),
         ("Sent", vec!["Sent", "Sent Items", "[Gmail]/Sent Mail"]),
         ("Trash", vec!["Trash", "Deleted Items", "[Gmail]/Trash"]),
+        ("Archive", vec!["Archive", "Archives"]),
     ];
     let mut count = 0;
 
@@ -3503,13 +3855,15 @@ fn collect_parsed_attachments(
 }
 
 #[tauri::command]
-fn send_message(app: tauri::AppHandle, input: SendInput) -> AppResult<()> {
-    start_mail_action_job(app, "Send message", move |app| {
-        run_send_message(app, input).map(|_| ())
-    })
+fn send_message(app: tauri::AppHandle, input: SendInput) -> AppResult<StoredMessage> {
+    debug(&app, "Send message started");
+    let sent = run_send_message(&app, input)?;
+    debug(&app, "Send message complete");
+    Ok(sent)
 }
 
 fn run_send_message(app: &tauri::AppHandle, input: SendInput) -> AppResult<StoredMessage> {
+    ensure_not_resetting(app)?;
     let state = app.state::<AppState>();
     let account = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -3564,9 +3918,9 @@ fn run_send_message(app: &tauri::AppHandle, input: SendInput) -> AppResult<Store
         to_addr: input.to,
         cc_addr: String::new(),
         date_ts: Utc::now().timestamp(),
-        snippet: input.body.chars().take(180).collect(),
+        snippet: snippet_for_body(&input.body, &input.body_mime),
         body: input.body,
-        body_mime: "text/plain".to_string(),
+        body_mime: input.body_mime,
         is_read: true,
         attachments: Vec::new(),
     };
@@ -3666,7 +4020,16 @@ fn build_outbound_message(
             .in_reply_to(message_id.clone())
             .references(references);
     }
-    builder.body(input.body.clone()).map_err(|e| e.to_string())
+    if input.body_mime.to_ascii_lowercase().contains("html") {
+        builder
+            .multipart(MultiPart::alternative_plain_html(
+                html_to_text(&input.body),
+                input.body.clone(),
+            ))
+            .map_err(|e| e.to_string())
+    } else {
+        builder.body(input.body.clone()).map_err(|e| e.to_string())
+    }
 }
 
 fn send_smtp(account: &StoredAccount, outbound: &SmtpMessage) -> AppResult<()> {
@@ -3684,7 +4047,10 @@ fn send_smtp(account: &StoredAccount, outbound: &SmtpMessage) -> AppResult<()> {
         .ok_or_else(|| "Missing SMTP password".to_string())?;
     let mailer = SmtpTransport::relay(host)
         .map_err(|e| e.to_string())?
-        .port(account.smtp_port.unwrap_or(587) as u16)
+        .port(validate_port(
+            account.smtp_port.unwrap_or(587),
+            "SMTP port",
+        )?)
         .timeout(Some(Duration::from_secs(30)))
         .credentials(Credentials::new(username.to_string(), password.to_string()))
         .build();
@@ -3792,23 +4158,35 @@ fn reply_header_id(provider_message_id: &str) -> Option<String> {
 
 #[tauri::command]
 fn delete_message(app: tauri::AppHandle, input: DeleteInput) -> AppResult<()> {
-    start_mail_action_job(app, "Delete message", move |app| {
-        run_delete_message(app, input)
-    })
+    debug(&app, "Delete message started");
+    run_delete_message(&app, input)?;
+    debug(&app, "Delete message complete");
+    Ok(())
 }
 
 fn run_delete_message(app: &tauri::AppHandle, input: DeleteInput) -> AppResult<()> {
+    ensure_not_resetting(app)?;
     let state = app.state::<AppState>();
-    let (account, provider_message_id, folder) = {
+    let (account, provider_message_id, message_header_id, folder) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let (account_id, provider_message_id, folder): (i64, String, String) = conn
+        let (account_id, provider_message_id, message_header_id, folder): (
+            i64,
+            String,
+            String,
+            String,
+        ) = conn
             .query_row(
-                "SELECT account_id, provider_message_id, folder FROM messages WHERE id = ?",
+                "SELECT account_id, provider_message_id, message_header_id, folder FROM messages WHERE id = ?",
                 params![input.message_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(|e| e.to_string())?;
-        (get_account(&conn, account_id)?, provider_message_id, folder)
+        (
+            get_account(&conn, account_id)?,
+            provider_message_id,
+            message_header_id,
+            folder,
+        )
     };
 
     let permanent = folder == "Trash";
@@ -3820,26 +4198,37 @@ fn run_delete_message(app: &tauri::AppHandle, input: DeleteInput) -> AppResult<(
         ),
     );
 
+    let mut moved_imap_provider_id = None;
+    let mut remove_unresolved_imap_row = false;
     if !is_local_sent_id(&provider_message_id) {
         if account.provider == "gmail" {
             delete_gmail_message(&state, &account, &provider_message_id, permanent)?;
         } else {
-            delete_imap_message(&account, &provider_message_id, permanent)?;
+            moved_imap_provider_id = delete_imap_message(
+                &account,
+                &provider_message_id,
+                permanent,
+                &message_header_id,
+            )?;
+            remove_unresolved_imap_row = !permanent && moved_imap_provider_id.is_none();
         }
     }
 
     let conn = state.db.lock().map_err(|e| e.to_string())?;
     if permanent {
+        delete_message_row(&conn, input.message_id)?;
+    } else if let Some(provider_id) = moved_imap_provider_id {
         conn.execute(
-            "DELETE FROM messages_fts WHERE rowid = ?",
-            params![input.message_id],
+            "
+            UPDATE messages
+            SET folder = 'Trash', provider_message_id = ?, updated_at = ?
+            WHERE id = ?
+            ",
+            params![provider_id, now_ts(), input.message_id],
         )
         .map_err(|e| e.to_string())?;
-        conn.execute(
-            "DELETE FROM messages WHERE id = ?",
-            params![input.message_id],
-        )
-        .map_err(|e| e.to_string())?;
+    } else if remove_unresolved_imap_row {
+        delete_message_row(&conn, input.message_id)?;
     } else {
         conn.execute(
             "UPDATE messages SET folder = 'Trash', updated_at = ? WHERE id = ?",
@@ -3883,12 +4272,116 @@ fn delete_gmail_message(
     Ok(())
 }
 
+#[tauri::command]
+fn archive_message(app: tauri::AppHandle, input: DeleteInput) -> AppResult<()> {
+    ensure_not_resetting(&app)?;
+    debug(&app, "Archive message started");
+    let state = app.state::<AppState>();
+    let (account, provider_message_id, message_header_id, folder) = {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        let (account_id, provider_message_id, message_header_id, folder): (
+            i64,
+            String,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT account_id, provider_message_id, message_header_id, folder FROM messages WHERE id = ?",
+                params![input.message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        (
+            get_account(&conn, account_id)?,
+            provider_message_id,
+            message_header_id,
+            folder,
+        )
+    };
+
+    if folder == "Archive" {
+        debug(&app, "Archive skipped because message is already archived");
+        return Ok(());
+    }
+    if folder == "Trash" {
+        return Err("Restore the message before archiving it".to_string());
+    }
+
+    let conn = state.db.lock().map_err(|e| e.to_string())?;
+    if is_local_sent_id(&provider_message_id) {
+        conn.execute(
+            "UPDATE messages SET folder = 'Archive', updated_at = ? WHERE id = ?",
+            params![now_ts(), input.message_id],
+        )
+        .map_err(|e| e.to_string())?;
+        debug(&app, "Archive message complete");
+        return Ok(());
+    }
+    drop(conn);
+
+    if account.provider == "gmail" {
+        archive_gmail_message(&state, &account, &provider_message_id)?;
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE messages SET folder = 'Archive', updated_at = ? WHERE id = ?",
+            params![now_ts(), input.message_id],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        let Some(location) = move_imap_message_to_folder(
+            &account,
+            &provider_message_id,
+            &["Archive", "Archives"],
+            &message_header_id,
+        )?
+        else {
+            return Err("No IMAP Archive folder accepted the message".to_string());
+        };
+        let provider_id =
+            imap_provider_message_id(&location.folder, location.uid, nonempty(&message_header_id));
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "
+            UPDATE messages
+            SET folder = 'Archive', provider_message_id = ?, updated_at = ?
+            WHERE id = ?
+            ",
+            params![provider_id, now_ts(), input.message_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    debug(&app, "Archive message complete");
+    Ok(())
+}
+
+fn archive_gmail_message(
+    state: &State<'_, AppState>,
+    account: &StoredAccount,
+    provider_message_id: &str,
+) -> AppResult<()> {
+    let token = gmail_access_token(state, account)?;
+    let body = serde_json::json!({ "removeLabelIds": ["INBOX"] });
+    Client::new()
+        .post(format!(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/{provider_message_id}/modify"
+        ))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .map_err(|e| e.to_string())?
+        .error_for_status()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn delete_imap_message(
     account: &StoredAccount,
     provider_message_id: &str,
     permanent: bool,
-) -> AppResult<()> {
-    let (folder, uid, _) = parse_imap_provider_message_id(provider_message_id)?;
+    message_header_id: &str,
+) -> AppResult<Option<String>> {
+    let (folder, uid, provider_message_id_header) =
+        parse_imap_provider_message_id(provider_message_id)?;
     let mut session = open_imap_session(account)?;
     session.select(&folder).map_err(|e| e.to_string())?;
     if permanent {
@@ -3897,33 +4390,116 @@ fn delete_imap_message(
             .map_err(|e| e.to_string())?;
         session.uid_expunge(uid.to_string()).ok();
         session.expunge().ok();
-    } else {
-        let mut moved = false;
-        for trash in ["Trash", "Deleted Items", "[Gmail]/Trash"] {
-            if session.uid_mv(uid.to_string(), trash).is_ok() {
-                moved = true;
-                break;
-            }
-            if session.uid_copy(uid.to_string(), trash).is_ok() {
-                session
-                    .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
-                    .map_err(|e| e.to_string())?;
-                session.uid_expunge(uid.to_string()).ok();
-                session.expunge().ok();
-                moved = true;
-                break;
-            }
+        session.logout().ok();
+        return Ok(None);
+    }
+
+    let lookup_message_id = nonempty(message_header_id)
+        .map(ToString::to_string)
+        .or_else(|| provider_message_id_header.map(ToString::to_string));
+    let mut moved_folder = None;
+    for trash in ["Trash", "Deleted Items", "[Gmail]/Trash"] {
+        if session.uid_mv(uid.to_string(), trash).is_ok() {
+            moved_folder = Some(trash.to_string());
+            break;
         }
-        if !moved {
+        if session.uid_copy(uid.to_string(), trash).is_ok() {
             session
                 .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
                 .map_err(|e| e.to_string())?;
             session.uid_expunge(uid.to_string()).ok();
             session.expunge().ok();
+            moved_folder = Some(trash.to_string());
+            break;
         }
     }
+    if let Some(folder) = moved_folder {
+        let moved_location = lookup_message_id.as_deref().and_then(|message_id| {
+            find_imap_uid_by_message_id(&mut session, &folder, message_id)
+                .ok()
+                .flatten()
+        });
+        session.logout().ok();
+        return Ok(moved_location
+            .map(|uid| imap_provider_message_id(&folder, uid, lookup_message_id.as_deref())));
+    }
+
+    session
+        .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+        .map_err(|e| e.to_string())?;
+    session.uid_expunge(uid.to_string()).ok();
+    session.expunge().ok();
     session.logout().ok();
-    Ok(())
+    Ok(None)
+}
+
+fn move_imap_message_to_folder(
+    account: &StoredAccount,
+    provider_message_id: &str,
+    target_folders: &[&str],
+    message_header_id: &str,
+) -> AppResult<Option<ImapMovedLocation>> {
+    let (folder, uid, provider_message_id_header) =
+        parse_imap_provider_message_id(provider_message_id)?;
+    let lookup_message_id = nonempty(message_header_id)
+        .map(ToString::to_string)
+        .or_else(|| provider_message_id_header.map(ToString::to_string));
+    let mut session = open_imap_session(account)?;
+    session.select(&folder).map_err(|e| e.to_string())?;
+    let mut moved_folder = None;
+    for target in target_folders {
+        if session.uid_mv(uid.to_string(), target).is_ok() {
+            moved_folder = Some((*target).to_string());
+            break;
+        }
+        if session.uid_copy(uid.to_string(), target).is_ok() {
+            session
+                .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
+                .map_err(|e| e.to_string())?;
+            session.uid_expunge(uid.to_string()).ok();
+            session.expunge().ok();
+            moved_folder = Some((*target).to_string());
+            break;
+        }
+    }
+    let Some(folder) = moved_folder else {
+        session.logout().ok();
+        return Ok(None);
+    };
+    let uid = lookup_message_id.as_deref().and_then(|message_id| {
+        find_imap_uid_by_message_id(&mut session, &folder, message_id)
+            .ok()
+            .flatten()
+    });
+    session.logout().ok();
+    Ok(uid.map(|uid| ImapMovedLocation { folder, uid }))
+}
+
+fn find_imap_uid_by_message_id(
+    session: &mut ImapSession,
+    folder: &str,
+    message_id: &str,
+) -> AppResult<Option<u32>> {
+    select_imap_folder(session, folder)?;
+    let query = format!("HEADER Message-ID {}", imap_search_quoted(message_id));
+    let uids = session
+        .uid_search(query)
+        .map_err(|e| format!("IMAP search by Message-ID failed: {}", imap_error(e)))?;
+    Ok(uids.into_iter().max())
+}
+
+fn imap_search_quoted(value: &str) -> String {
+    let mut escaped = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\r' | '\n' => escaped.push(' '),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn open_imap_session(
@@ -3933,7 +4509,7 @@ fn open_imap_session(
         .imap_host
         .as_deref()
         .ok_or_else(|| "Missing IMAP host".to_string())?;
-    let port = account.imap_port.unwrap_or(993) as u16;
+    let port = validate_port(account.imap_port.unwrap_or(993), "IMAP port")?;
     let username = account
         .username
         .as_deref()
@@ -3959,16 +4535,21 @@ fn parse_imap_provider_message_id(
 }
 
 #[tauri::command]
-fn download_attachment(app: tauri::AppHandle, input: DownloadAttachmentInput) -> AppResult<()> {
-    start_mail_action_job(app, "Download attachment", move |app| {
-        run_download_attachment(app, input).map(|_| ())
-    })
+fn download_attachment(
+    app: tauri::AppHandle,
+    input: DownloadAttachmentInput,
+) -> AppResult<DownloadedAttachment> {
+    debug(&app, "Download attachment started");
+    let downloaded = run_download_attachment(&app, input)?;
+    debug(&app, "Download attachment complete");
+    Ok(downloaded)
 }
 
 fn run_download_attachment(
     app: &tauri::AppHandle,
     input: DownloadAttachmentInput,
 ) -> AppResult<DownloadedAttachment> {
+    ensure_not_resetting(app)?;
     let state = app.state::<AppState>();
     let (account, message_provider_id, attachment_provider_id, data): (
         StoredAccount,
@@ -4065,19 +4646,16 @@ fn write_download_to_path(save_path: &str, bytes: &[u8]) -> AppResult<PathBuf> {
 
 #[tauri::command]
 fn mark_message_read(app: tauri::AppHandle, input: MarkReadInput) -> AppResult<()> {
-    start_mail_action_job(app, "Mark message read state", move |app| {
-        run_mark_message_read(app, input)
-    })
+    run_mark_message_read(&app, input)
 }
 
 #[tauri::command]
 fn mark_thread_read(app: tauri::AppHandle, input: MarkReadInput) -> AppResult<()> {
-    start_mail_action_job(app, "Mark thread read state", move |app| {
-        run_mark_thread_read(app, input)
-    })
+    run_mark_thread_read(&app, input)
 }
 
 fn run_mark_thread_read(app: &tauri::AppHandle, input: MarkReadInput) -> AppResult<()> {
+    ensure_not_resetting(app)?;
     let state = app.state::<AppState>();
     let folder_scope = match input.folder.as_deref() {
         Some("Trash") => "AND folder = 'Trash'",
@@ -4155,6 +4733,7 @@ fn run_mark_thread_read(app: &tauri::AppHandle, input: MarkReadInput) -> AppResu
 }
 
 fn run_mark_message_read(app: &tauri::AppHandle, input: MarkReadInput) -> AppResult<()> {
+    ensure_not_resetting(app)?;
     let state = app.state::<AppState>();
     let (account, provider_message_id) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -4200,6 +4779,7 @@ fn run_mark_message_read(app: &tauri::AppHandle, input: MarkReadInput) -> AppRes
 #[tauri::command]
 fn remove_account(state: State<'_, AppState>, input: RemoveAccountInput) -> AppResult<()> {
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    delete_account_secrets(input.account_id)?;
     conn.execute(
         "DELETE FROM accounts WHERE id = ?",
         params![input.account_id],
@@ -4212,18 +4792,35 @@ fn remove_account(state: State<'_, AppState>, input: RemoveAccountInput) -> AppR
 fn reset_database(app: tauri::AppHandle) -> AppResult<()> {
     {
         let state = app.state::<AppState>();
-        let mut syncing = state.syncing.lock().map_err(|e| e.to_string())?;
+        let mut resetting = state.resetting.lock().map_err(|e| e.to_string())?;
+        if *resetting {
+            return Err("Database reset is already running".to_string());
+        }
+        *resetting = true;
+        drop(resetting);
+
+        let syncing = state.syncing.lock().map_err(|e| e.to_string())?;
         if *syncing {
+            if let Ok(mut resetting) = state.resetting.lock() {
+                *resetting = false;
+            }
             return Err("Cannot reset the database while sync is running".to_string());
         }
-        *syncing = true;
+        drop(syncing);
+        let polling = state.polling.lock().map_err(|e| e.to_string())?;
+        if *polling {
+            if let Ok(mut resetting) = state.resetting.lock() {
+                *resetting = false;
+            }
+            return Err("Cannot reset the database while live poll is running".to_string());
+        }
     }
 
     let result = reset_database_inner(&app);
 
     let state = app.state::<AppState>();
-    if let Ok(mut syncing) = state.syncing.lock() {
-        *syncing = false;
+    if let Ok(mut resetting) = state.resetting.lock() {
+        *resetting = false;
     }
 
     result
@@ -4238,6 +4835,7 @@ fn reset_database_inner(app: &tauri::AppHandle) -> AppResult<()> {
 
     {
         let mut conn = state.db.lock().map_err(|e| e.to_string())?;
+        delete_all_account_secrets(&conn)?;
         let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
         let replacement = Connection::open_in_memory().map_err(|e| e.to_string())?;
         *conn = replacement;
@@ -4282,16 +4880,18 @@ fn update_imap_settings(
     state: State<'_, AppState>,
     input: UpdateImapSettingsInput,
 ) -> AppResult<()> {
-    if input.email.trim().is_empty()
-        || input.imap_host.trim().is_empty()
-        || input.smtp_host.trim().is_empty()
-        || input.username.trim().is_empty()
-    {
-        return Err("Email, IMAP host, SMTP host, and username are required".to_string());
-    }
-    if !(1..=65535).contains(&input.imap_port) || !(1..=65535).contains(&input.smtp_port) {
-        return Err("Ports must be between 1 and 65535".to_string());
-    }
+    let email = required_input(&input.email, "Email")?;
+    let imap_host = required_input(&input.imap_host, "IMAP host")?;
+    let smtp_host = required_input(&input.smtp_host, "SMTP host")?;
+    let username = required_input(&input.username, "Username")?;
+    let imap_port = validate_port(input.imap_port, "IMAP port")?;
+    let smtp_port = validate_port(input.smtp_port, "SMTP port")?;
+    let display_name = input
+        .display_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
 
     let existing_password = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -4315,44 +4915,42 @@ fn update_imap_settings(
         &app,
         format!(
             "IMAP settings update test account_id={} email={} imap={}:{} smtp={}:{} username={}",
-            input.account_id,
-            input.email,
-            input.imap_host,
-            input.imap_port,
-            input.smtp_host,
-            input.smtp_port,
-            input.username
+            input.account_id, email, imap_host, imap_port, smtp_host, smtp_port, username
         ),
     );
     let tls = native_tls::TlsConnector::builder()
         .build()
         .map_err(|e| e.to_string())?;
-    let client = connect_imap_client(input.imap_host.as_str(), input.imap_port as u16, &tls)?;
+    let client = connect_imap_client(imap_host.as_str(), imap_port, &tls)?;
     let mut session = client
-        .login(input.username.as_str(), password.as_str())
+        .login(username.as_str(), password.as_str())
         .map_err(|e| format!("IMAP login failed or timed out after 15s: {}", e.0))?;
     session.logout().ok();
+    validate_smtp_login(&smtp_host, smtp_port, &username, &password)?;
 
     let conn = state.db.lock().map_err(|e| e.to_string())?;
+    if input
+        .password
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+    {
+        store_account_secret(input.account_id, "password", &password)?;
+    }
     conn.execute(
         "
         UPDATE accounts
         SET email = ?, display_name = ?, imap_host = ?, imap_port = ?,
-            smtp_host = ?, smtp_port = ?, username = ?, password = ?
+            smtp_host = ?, smtp_port = ?, username = ?, password = NULL
         WHERE id = ? AND provider = 'imap'
         ",
         params![
-            input.email.trim(),
-            input
-                .display_name
-                .as_deref()
-                .filter(|value| !value.is_empty()),
-            input.imap_host.trim(),
+            email,
+            display_name,
+            imap_host,
             input.imap_port,
-            input.smtp_host.trim(),
+            smtp_host,
             input.smtp_port,
-            input.username.trim(),
-            password,
+            username,
             input.account_id
         ],
     )
@@ -4418,6 +5016,7 @@ pub fn run() {
                 db: Mutex::new(conn),
                 syncing: Mutex::new(false),
                 polling: Mutex::new(false),
+                resetting: Mutex::new(false),
                 idle_accounts: Mutex::new(HashSet::new()),
             });
             start_mail_polling(app.handle().clone());
@@ -4425,6 +5024,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            archive_message,
             connect_gmail,
             connect_imap,
             delete_message,

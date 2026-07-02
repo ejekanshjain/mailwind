@@ -1,4 +1,5 @@
 import {
+  type ClipboardEvent,
   type CSSProperties,
   type KeyboardEvent,
   useEffect,
@@ -18,23 +19,34 @@ import {
 } from "@tauri-apps/plugin-notification";
 import {
   Archive,
+  Bold,
   Bug,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Download,
   EyeOff,
+  Heading2,
+  Italic,
   Inbox,
+  Link,
+  List,
+  ListOrdered,
   Mail,
   Palette,
   Paperclip,
   PenLine,
   RefreshCw,
+  RemoveFormatting,
   Search,
   Send,
   Settings,
   SlidersHorizontal,
+  TextQuote,
   Trash2,
+  Type,
+  Underline,
+  Unlink,
 } from "lucide-react";
 import "./App.css";
 
@@ -103,6 +115,10 @@ type MailboxChanged = {
   unread_inbox: number;
 };
 
+type DownloadedAttachment = {
+  path: string;
+};
+
 type ReadFilter = "all" | "read" | "unread";
 type AppView = "mail" | "settings";
 
@@ -111,6 +127,7 @@ type ComposerState = {
   to: string;
   subject: string;
   body: string;
+  body_mime: string;
   reply_to_message_id: number | null;
 };
 
@@ -139,6 +156,7 @@ const emptyComposer: ComposerState = {
   to: "",
   subject: "",
   body: "",
+  body_mime: "text/html",
   reply_to_message_id: null,
 };
 
@@ -213,7 +231,7 @@ function App() {
   const messageRowRefs = useRef<Record<number, HTMLButtonElement | null>>({});
   const openEmailLinkRef = useRef<(rawUrl: string) => void>(() => undefined);
   const leftAltDownRef = useRef(false);
-  const composerBodyRef = useRef<HTMLTextAreaElement | null>(null);
+  const composerBodyRef = useRef<HTMLDivElement | null>(null);
   const threadRequestRef = useRef(0);
   const [gmailForm, setGmailForm] = useState({ client_id: "", client_secret: "" });
   const [imapForm, setImapForm] = useState({
@@ -233,10 +251,20 @@ function App() {
       (selectedMessage?.id === selectedId ? selectedMessage : null),
     [snapshot.messages, selectedId, selectedMessage],
   );
+  const composerPlainText = useMemo(
+    () => htmlToPlainText(composer.body),
+    [composer.body],
+  );
 
   useEffect(() => {
     void load();
   }, [folder, accountId, page, readFilter]);
+
+  useEffect(() => {
+    const editor = composerBodyRef.current;
+    if (!editor || editor.innerHTML === composer.body) return;
+    editor.innerHTML = composer.body;
+  }, [composer.body, showComposer]);
 
   useEffect(() => {
     if (themeOverridden) {
@@ -335,13 +363,6 @@ function App() {
         setSyncing(false);
         setStatus(event.payload);
       }
-      if (event.payload.startsWith("Mail action complete")) {
-        setStatus(event.payload.replace("Mail action complete: ", ""));
-        void load();
-      }
-      if (event.payload.startsWith("Mail action failed")) {
-        setStatus(event.payload);
-      }
     }).then((unlisten) => {
       cleanupDebug = unlisten;
     });
@@ -365,6 +386,48 @@ function App() {
     const line = `${new Date().toLocaleTimeString()} ${message}`;
     console.info("[mailwind]", message);
     setDebugLines((lines) => [...lines.slice(-79), line]);
+  }
+
+  function syncComposerBody() {
+    const html = composerBodyRef.current?.innerHTML ?? "";
+    setComposer((current) => ({
+      ...current,
+      body: normalizeComposerHtml(html),
+      body_mime: "text/html",
+    }));
+  }
+
+  function runEditorCommand(command: string, value?: string) {
+    const editor = composerBodyRef.current;
+    if (!editor) return;
+    editor.focus();
+    document.execCommand(command, false, value);
+    syncComposerBody();
+  }
+
+  function formatComposer(command: string, value?: string) {
+    runEditorCommand(command, value);
+  }
+
+  function addComposerLink() {
+    const href = window.prompt("URL");
+    const safeHref = href ? safeExternalUrl(href) : "";
+    if (!safeHref) {
+      if (href) setStatus("Blocked unsafe link");
+      return;
+    }
+    runEditorCommand("createLink", safeHref);
+  }
+
+  function pasteIntoComposer(event: ClipboardEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const html = event.clipboardData.getData("text/html");
+    const text = event.clipboardData.getData("text/plain");
+    const safeHtml = html
+      ? sanitizeComposerHtml(html)
+      : plainTextToHtml(text);
+    document.execCommand("insertHTML", false, safeHtml);
+    syncComposerBody();
   }
 
   async function load(nextQuery = query, pageOverride = page) {
@@ -618,15 +681,24 @@ function App() {
       pushDebug("Send blocked: no account selected");
       return;
     }
-    setStatus("Sending in background");
-    pushDebug("Send queued in background");
+    const htmlBody = sanitizeComposerHtml(composer.body);
+    const plainBody = htmlToPlainText(htmlBody);
+    if (!plainBody.trim()) {
+      setStatus("Write a message before sending");
+      pushDebug("Send blocked: empty message body");
+      composerBodyRef.current?.focus();
+      return;
+    }
+    setStatus("Sending");
+    pushDebug("Sending message");
     try {
-      await invoke<void>("send_message", {
+      await invoke<MailMessage>("send_message", {
         input: {
           account_id: account.id,
           to: composer.to,
           subject: composer.subject,
-          body: composer.body,
+          body: htmlBody,
+          body_mime: composer.body_mime,
           reply_to_message_id: composer.reply_to_message_id,
         },
       });
@@ -635,6 +707,8 @@ function App() {
       setSelectedMessage(null);
       setThreadMessages([]);
       setFolder("Sent");
+      setStatus("Sent");
+      pushDebug("Sent");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(message);
@@ -651,6 +725,7 @@ function App() {
       to: "",
       subject: "",
       body: "",
+      body_mime: "text/html",
       reply_to_message_id: null,
     });
     setShowComposer(true);
@@ -668,6 +743,7 @@ function App() {
       to: replyAddress(replyTarget),
       subject: replySubject(replyTarget.subject),
       body: "",
+      body_mime: "text/html",
       reply_to_message_id: replyTarget.id,
     });
     setShowComposer(true);
@@ -733,6 +809,23 @@ function App() {
   };
 
 
+  async function archiveSelected() {
+    if (!selected || selected.folder === "Archive" || selected.folder === "Trash") return;
+    setStatus("Archiving");
+    pushDebug("Archiving message");
+    try {
+      await invoke<void>("archive_message", { input: { message_id: selected.id } });
+      clearCurrentMessage();
+      setStatus("Archived");
+      pushDebug("Archived");
+      await load();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setStatus(message);
+      pushDebug(`Error: ${message}`);
+    }
+  }
+
   async function deleteSelected() {
     if (!selected) return;
     const permanent = selected.folder === "Trash";
@@ -742,13 +835,14 @@ function App() {
         : "Move this email to Trash?",
     );
     if (!ok) return;
-    setStatus(permanent ? "Deleting in background" : "Moving to Trash in background");
-    pushDebug(permanent ? "Delete queued in background" : "Move to Trash queued in background");
+    setStatus(permanent ? "Deleting" : "Moving to Trash");
+    pushDebug(permanent ? "Deleting message" : "Moving message to Trash");
     try {
       await invoke<void>("delete_message", { input: { message_id: selected.id } });
-      setSelectedId(null);
-      setSelectedMessage(null);
-      setThreadMessages([]);
+      clearCurrentMessage();
+      setStatus(permanent ? "Deleted" : "Moved to Trash");
+      pushDebug(permanent ? "Deleted" : "Moved to Trash");
+      await load();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(message);
@@ -765,12 +859,14 @@ function App() {
       pushDebug("Download canceled");
       return;
     }
-    setStatus(`Downloading ${attachment.filename} in background`);
-    pushDebug(`Download queued path=${savePath}`);
+    setStatus(`Downloading ${attachment.filename}`);
+    pushDebug(`Downloading attachment path=${savePath}`);
     try {
-      await invoke<void>("download_attachment", {
+      const downloaded = await invoke<DownloadedAttachment>("download_attachment", {
         input: { attachment_id: attachment.id, save_path: savePath },
       });
+      setStatus("Downloaded attachment");
+      pushDebug(`Downloaded attachment path=${downloaded.path}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(message);
@@ -886,6 +982,7 @@ function App() {
       : [selected]
     : [];
   const selectedThreadUnread = selected ? isThreadUnread(selected) : false;
+  const canArchiveSelected = Boolean(selected && selected.folder !== "Archive" && selected.folder !== "Trash");
   const shellStyle = {
     "--accent": accentColor,
     "--accent-rgb": hexToRgb(accentColor),
@@ -925,6 +1022,9 @@ function App() {
           </button>
           <button className="command" disabled={syncing} onClick={syncAll} title={syncing ? "Syncing" : "Sync"} aria-label="Sync mail">
             <RefreshCw size={18} /> <span className="command-label">Sync</span> <span className="shortcut">S</span>
+          </button>
+          <button className="command" disabled={!canArchiveSelected} onClick={archiveSelected} title="Archive" aria-label="Archive email">
+            <Archive size={18} /> <span className="command-label">Archive</span>
           </button>
           <button className="command" disabled={!selected} onClick={deleteSelected} title={selected?.folder === "Trash" ? "Delete forever" : "Delete"} aria-label={selected?.folder === "Trash" ? "Delete forever" : "Delete email"}>
             <Trash2 size={18} /> <span className="command-label">Delete</span> <span className="shortcut">D</span>
@@ -1349,6 +1449,9 @@ function App() {
                   <button onClick={() => selected && void markThreadRead(selected, selectedThreadUnread)} title={selectedThreadUnread ? "Mark read" : "Mark unread"}>
                     {selectedThreadUnread ? <CheckCircle2 size={18} /> : <EyeOff size={18} />}
                   </button>
+                  <button disabled={!canArchiveSelected} onClick={archiveSelected} title="Archive">
+                    <Archive size={18} />
+                  </button>
                   <button disabled={!selected} onClick={deleteSelected} title={selected.folder === "Trash" ? "Delete forever" : "Delete"}>
                     <Trash2 size={18} />
                   </button>
@@ -1403,7 +1506,8 @@ function App() {
                     {isHtmlMessage(message) ? (
                       <iframe
                         className="html-body thread-html-body"
-                        sandbox="allow-scripts"
+                        referrerPolicy="no-referrer"
+                        sandbox="allow-popups allow-same-origin"
                         title={`Email HTML body from ${shortName(message.from_addr || message.account_email)}`}
                         srcDoc={sanitizeHtml(message.body)}
                         onLoad={(event) => resizeEmailFrame(event.currentTarget)}
@@ -1465,16 +1569,152 @@ function App() {
                 required
               />
             </div>
-            <textarea
-              ref={composerBodyRef}
-              value={composer.body}
-              onChange={(event) => setComposer({ ...composer, body: event.currentTarget.value })}
-              placeholder={selected ? `Reply from ${sendingAccount?.email ?? "selected account"}` : "Write a new message"}
-              required
-            />
-            <button className="primary" type="submit">
-              Send
-            </button>
+            <div className="composer-editor-shell">
+              <div className="composer-toolbar" aria-label="Message formatting">
+                <button
+                  aria-label="Bold"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    formatComposer("bold");
+                  }}
+                  title="Bold"
+                  type="button"
+                >
+                  <Bold size={16} />
+                </button>
+                <button
+                  aria-label="Italic"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    formatComposer("italic");
+                  }}
+                  title="Italic"
+                  type="button"
+                >
+                  <Italic size={16} />
+                </button>
+                <button
+                  aria-label="Underline"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    formatComposer("underline");
+                  }}
+                  title="Underline"
+                  type="button"
+                >
+                  <Underline size={16} />
+                </button>
+                <span aria-hidden="true" className="toolbar-divider" />
+                <button
+                  aria-label="Heading"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    formatComposer("formatBlock", "h2");
+                  }}
+                  title="Heading"
+                  type="button"
+                >
+                  <Heading2 size={16} />
+                </button>
+                <button
+                  aria-label="Paragraph"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    formatComposer("formatBlock", "p");
+                  }}
+                  title="Paragraph"
+                  type="button"
+                >
+                  <Type size={16} />
+                </button>
+                <button
+                  aria-label="Quote"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    formatComposer("formatBlock", "blockquote");
+                  }}
+                  title="Quote"
+                  type="button"
+                >
+                  <TextQuote size={16} />
+                </button>
+                <span aria-hidden="true" className="toolbar-divider" />
+                <button
+                  aria-label="Bulleted list"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    formatComposer("insertUnorderedList");
+                  }}
+                  title="Bulleted list"
+                  type="button"
+                >
+                  <List size={16} />
+                </button>
+                <button
+                  aria-label="Numbered list"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    formatComposer("insertOrderedList");
+                  }}
+                  title="Numbered list"
+                  type="button"
+                >
+                  <ListOrdered size={16} />
+                </button>
+                <span aria-hidden="true" className="toolbar-divider" />
+                <button
+                  aria-label="Add link"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    addComposerLink();
+                  }}
+                  title="Add link"
+                  type="button"
+                >
+                  <Link size={16} />
+                </button>
+                <button
+                  aria-label="Remove link"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    formatComposer("unlink");
+                  }}
+                  title="Remove link"
+                  type="button"
+                >
+                  <Unlink size={16} />
+                </button>
+                <button
+                  aria-label="Clear formatting"
+                  onMouseDown={(event) => {
+                    event.preventDefault();
+                    formatComposer("removeFormat");
+                  }}
+                  title="Clear formatting"
+                  type="button"
+                >
+                  <RemoveFormatting size={16} />
+                </button>
+              </div>
+              <div
+                aria-label="Message body"
+                className="composer-editor"
+                contentEditable
+                data-placeholder={selected ? `Reply from ${sendingAccount?.email ?? "selected account"}` : "Write a new message"}
+                onInput={syncComposerBody}
+                onPaste={pasteIntoComposer}
+                ref={composerBodyRef}
+                role="textbox"
+                spellCheck
+                suppressContentEditableWarning
+              />
+            </div>
+            <div className="composer-actions">
+              <span>{composerPlainText.trim().length ? `${composerPlainText.trim().length} chars` : ""}</span>
+              <button className="primary" disabled={!composerPlainText.trim()} type="submit">
+                Send
+              </button>
+            </div>
           </form>
         </details>
 
@@ -1627,12 +1867,33 @@ function colorForInitials(initials: string) {
 function sanitizeHtml(value: string) {
   const parser = new DOMParser();
   const doc = parser.parseFromString(value, "text/html");
-  doc.querySelectorAll("script, object, embed, iframe, form").forEach((node) => node.remove());
+  doc.querySelectorAll("script, object, embed, iframe, form, link, meta").forEach((node) => node.remove());
   doc.querySelectorAll("*").forEach((node) => {
     for (const attr of Array.from(node.attributes)) {
       const name = attr.name.toLowerCase();
-      const attrValue = attr.value.trim().toLowerCase();
+      const rawValue = attr.value.trim();
+      const attrValue = rawValue.toLowerCase();
       if (name.startsWith("on") || attrValue.startsWith("javascript:")) {
+        node.removeAttribute(attr.name);
+        continue;
+      }
+      if (["srcset", "ping", "action", "formaction"].includes(name)) {
+        node.removeAttribute(attr.name);
+        continue;
+      }
+      if (["src", "poster", "background"].includes(name)) {
+        const safeUrl = safeEmbeddedUrl(rawValue);
+        if (safeUrl) {
+          node.setAttribute(attr.name, safeUrl);
+        } else {
+          node.removeAttribute(attr.name);
+          if (node.tagName.toLowerCase() === "img" && !node.getAttribute("alt")) {
+            node.setAttribute("alt", "Remote image blocked");
+          }
+        }
+        continue;
+      }
+      if (name === "style" && (/url\s*\(/i.test(rawValue) || /@import/i.test(rawValue))) {
         node.removeAttribute(attr.name);
       }
     }
@@ -1648,8 +1909,111 @@ function sanitizeHtml(value: string) {
       node.removeAttribute("href");
     }
   });
-  const linkBridgeScript = `<script>(()=>{document.addEventListener("click",(event)=>{const target=event.target;if(!(target instanceof Element))return;const anchor=target.closest("a[href]");if(!anchor)return;event.preventDefault();window.parent.postMessage({type:"mailwind-open-email-link",href:anchor.getAttribute("href")||anchor.href||""},"*");},true);})();<\/script>`;
-  return `<!doctype html><html><head><base target="_blank"><style>html{background:#fff;overflow:hidden}body{box-sizing:border-box;max-width:100%;margin:0;padding:18px 34px 30px;color:#1f2937;font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere;word-break:normal}img,video{max-width:100%;height:auto}table{max-width:100%;border-collapse:collapse}td,th{max-width:100%;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{overflow-wrap:anywhere}blockquote{margin-left:0;padding-left:14px;border-left:3px solid #e5e7eb;color:#4b5563}@media(max-width:700px){body{padding:16px 18px 24px}}</style>${linkBridgeScript}</head><body>${doc.body.innerHTML}</body></html>`;
+  return `<!doctype html><html><head><base target="_blank"><style>html{background:#fff;overflow:hidden}body{box-sizing:border-box;max-width:100%;margin:0;padding:18px 34px 30px;color:#1f2937;font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere;word-break:normal}img,video{max-width:100%;height:auto}table{max-width:100%;border-collapse:collapse}td,th{max-width:100%;overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{overflow-wrap:anywhere}blockquote{margin-left:0;padding-left:14px;border-left:3px solid #e5e7eb;color:#4b5563}@media(max-width:700px){body{padding:16px 18px 24px}}</style></head><body>${doc.body.innerHTML}</body></html>`;
+}
+
+function normalizeComposerHtml(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "<br>" || trimmed === "<div><br></div>" || trimmed === "<p><br></p>") {
+    return "";
+  }
+  return trimmed;
+}
+
+function sanitizeComposerHtml(value: string) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(value, "text/html");
+  doc.querySelectorAll("script, object, embed, iframe, form, link, meta, style").forEach((node) => node.remove());
+  doc.querySelectorAll("*").forEach((node) => {
+    const tag = node.tagName.toLowerCase();
+    if (!allowedComposerTags.has(tag)) {
+      node.replaceWith(...Array.from(node.childNodes));
+      return;
+    }
+    for (const attr of Array.from(node.attributes)) {
+      const name = attr.name.toLowerCase();
+      const rawValue = attr.value.trim();
+      if (tag === "a" && name === "href") {
+        const safeHref = safeExternalUrl(rawValue);
+        if (safeHref) {
+          node.setAttribute("href", safeHref);
+          node.setAttribute("target", "_blank");
+          node.setAttribute("rel", "noreferrer noopener");
+        } else {
+          node.removeAttribute(attr.name);
+        }
+        continue;
+      }
+      if (name === "style") {
+        const safeStyle = safeComposerStyle(rawValue);
+        if (safeStyle) {
+          node.setAttribute("style", safeStyle);
+        } else {
+          node.removeAttribute(attr.name);
+        }
+        continue;
+      }
+      node.removeAttribute(attr.name);
+    }
+  });
+  return normalizeComposerHtml(doc.body.innerHTML);
+}
+
+const allowedComposerTags = new Set([
+  "a",
+  "b",
+  "blockquote",
+  "br",
+  "div",
+  "em",
+  "h1",
+  "h2",
+  "h3",
+  "i",
+  "li",
+  "ol",
+  "p",
+  "span",
+  "strong",
+  "u",
+  "ul",
+]);
+
+function safeComposerStyle(value: string) {
+  const allowed = value
+    .split(";")
+    .map((part) => part.trim())
+    .filter((part) => /^text-align\s*:\s*(left|right|center)$/i.test(part));
+  return allowed.join("; ");
+}
+
+function plainTextToHtml(value: string) {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim() ? `<p>${escapeHtml(line)}</p>` : "<p><br></p>")
+    .join("");
+}
+
+function htmlToPlainText(value: string) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(value, "text/html");
+  return (doc.body.textContent ?? "").replace(/\u00a0/g, " ").trim();
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function safeEmbeddedUrl(value: string) {
+  const candidate = value.trim();
+  if (/^data:image\//i.test(candidate) || /^cid:/i.test(candidate)) {
+    return candidate;
+  }
+  return "";
 }
 
 function safeExternalUrl(value: string) {
